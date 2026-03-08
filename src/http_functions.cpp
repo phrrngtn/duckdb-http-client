@@ -150,11 +150,19 @@ static HttpResult ExecuteRequest(const HttpBindData &bind_data) {
 	auto *limiter = GetRateLimiterRegistry().GetOrCreate(host, config.rate_limit_spec, config.burst);
 	if (limiter) {
 		int max_retries = 50;
+		bool was_paced = false;
+		double total_pacing = 0.0;
 		while (!limiter->TryAcquire() && max_retries-- > 0) {
 			double wait = limiter->WaitTime();
 			if (wait > 0.0) {
+				was_paced = true;
+				total_pacing += wait;
 				std::this_thread::sleep_for(std::chrono::duration<double>(wait));
 			}
+		}
+		limiter->RecordRequest();
+		if (was_paced) {
+			limiter->RecordPacing(total_pacing);
 		}
 	}
 
@@ -239,6 +247,20 @@ static HttpResult ExecuteRequest(const HttpBindData &bind_data) {
 		response = session.Options();
 	} else {
 		throw std::runtime_error("Unsupported HTTP method: " + method);
+	}
+
+	// If the server returned 429 Too Many Requests, feed back to the rate limiter
+	if (response.status_code == 429 && limiter) {
+		double retry_after = 1.0; // default backoff
+		auto it = response.header.find("Retry-After");
+		if (it != response.header.end()) {
+			try {
+				retry_after = std::stod(it->second);
+			} catch (...) {
+				// Retry-After might be a date string — fall back to default
+			}
+		}
+		limiter->RecordThrottle(retry_after);
 	}
 
 	// Build result
@@ -621,6 +643,122 @@ static void RegisterHttpRawRequestScalar(duckdb_connection connection) {
 }
 
 // ---------------------------------------------------------------------------
+// Table function: http_rate_limit_stats()
+// Returns one row per host with rate limiter diagnostics.
+// ---------------------------------------------------------------------------
+
+struct RateLimitStatsData {
+	struct HostStats {
+		std::string host;
+		std::string rate_spec;
+		double rate_rps;
+		double burst;
+		uint64_t requests;
+		uint64_t paced;
+		double total_wait_seconds;
+		uint64_t throttled_429;
+		double backlog_seconds;
+	};
+	std::vector<HostStats> rows;
+	idx_t current_row = 0;
+};
+
+static void DestroyRateLimitStatsData(void *data) {
+	delete static_cast<RateLimitStatsData *>(data);
+}
+
+static void RateLimitStatsBind(duckdb_bind_info info) {
+	// Snapshot the stats at bind time
+	auto *data = new RateLimitStatsData();
+	GetRateLimiterRegistry().ForEach([&](const std::string &host, GCRARateLimiter &limiter) {
+		data->rows.push_back({host, limiter.RateSpec(), limiter.Rate(), limiter.Burst(), limiter.Requests(),
+		    limiter.Paced(), limiter.TotalWaitSeconds(), limiter.Throttled429(), limiter.BacklogSeconds()});
+	});
+
+	duckdb_logical_type varchar_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+	duckdb_logical_type bigint_type = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+	duckdb_logical_type double_type = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
+
+	duckdb_bind_add_result_column(info, "host", varchar_type);
+	duckdb_bind_add_result_column(info, "rate_limit", varchar_type);
+	duckdb_bind_add_result_column(info, "rate_rps", double_type);
+	duckdb_bind_add_result_column(info, "burst", double_type);
+	duckdb_bind_add_result_column(info, "requests", bigint_type);
+	duckdb_bind_add_result_column(info, "paced", bigint_type);
+	duckdb_bind_add_result_column(info, "total_wait_seconds", double_type);
+	duckdb_bind_add_result_column(info, "throttled_429", bigint_type);
+	duckdb_bind_add_result_column(info, "backlog_seconds", double_type);
+
+	duckdb_destroy_logical_type(&varchar_type);
+	duckdb_destroy_logical_type(&bigint_type);
+	duckdb_destroy_logical_type(&double_type);
+
+	duckdb_bind_set_cardinality(info, data->rows.size(), true);
+	duckdb_bind_set_bind_data(info, data, DestroyRateLimitStatsData);
+}
+
+static void RateLimitStatsInit(duckdb_init_info info) {
+	// No per-thread state needed; we use bind_data.current_row
+}
+
+static void RateLimitStatsExecute(duckdb_function_info info, duckdb_data_chunk output) {
+	auto *data = static_cast<RateLimitStatsData *>(duckdb_function_get_bind_data(info));
+
+	idx_t remaining = data->rows.size() - data->current_row;
+	idx_t count = std::min(remaining, duckdb_vector_size());
+	if (count == 0) {
+		duckdb_data_chunk_set_size(output, 0);
+		return;
+	}
+
+	duckdb_vector host_vec = duckdb_data_chunk_get_vector(output, 0);
+	duckdb_vector rate_limit_vec = duckdb_data_chunk_get_vector(output, 1);
+	duckdb_vector rate_rps_vec = duckdb_data_chunk_get_vector(output, 2);
+	duckdb_vector burst_vec = duckdb_data_chunk_get_vector(output, 3);
+	duckdb_vector requests_vec = duckdb_data_chunk_get_vector(output, 4);
+	duckdb_vector paced_vec = duckdb_data_chunk_get_vector(output, 5);
+	duckdb_vector wait_vec = duckdb_data_chunk_get_vector(output, 6);
+	duckdb_vector throttled_vec = duckdb_data_chunk_get_vector(output, 7);
+	duckdb_vector backlog_vec = duckdb_data_chunk_get_vector(output, 8);
+
+	auto *rate_rps_data = (double *)duckdb_vector_get_data(rate_rps_vec);
+	auto *burst_data = (double *)duckdb_vector_get_data(burst_vec);
+	auto *requests_data = (int64_t *)duckdb_vector_get_data(requests_vec);
+	auto *paced_data = (int64_t *)duckdb_vector_get_data(paced_vec);
+	auto *wait_data = (double *)duckdb_vector_get_data(wait_vec);
+	auto *throttled_data = (int64_t *)duckdb_vector_get_data(throttled_vec);
+	auto *backlog_data = (double *)duckdb_vector_get_data(backlog_vec);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto &row = data->rows[data->current_row + i];
+		duckdb_vector_assign_string_element_len(host_vec, i, row.host.c_str(), row.host.length());
+		duckdb_vector_assign_string_element_len(rate_limit_vec, i, row.rate_spec.c_str(), row.rate_spec.length());
+		rate_rps_data[i] = row.rate_rps;
+		burst_data[i] = row.burst;
+		requests_data[i] = static_cast<int64_t>(row.requests);
+		paced_data[i] = static_cast<int64_t>(row.paced);
+		wait_data[i] = row.total_wait_seconds;
+		throttled_data[i] = static_cast<int64_t>(row.throttled_429);
+		backlog_data[i] = row.backlog_seconds;
+	}
+
+	data->current_row += count;
+	duckdb_data_chunk_set_size(output, count);
+}
+
+static void RegisterRateLimitStatsFunction(duckdb_connection connection) {
+	duckdb_table_function function = duckdb_create_table_function();
+	duckdb_table_function_set_name(function, "http_rate_limit_stats");
+
+	duckdb_table_function_set_bind(function, RateLimitStatsBind);
+	duckdb_table_function_set_init(function, RateLimitStatsInit);
+	duckdb_table_function_set_function(function, RateLimitStatsExecute);
+
+	duckdb_register_table_function(connection, function);
+	duckdb_destroy_table_function(&function);
+}
+
+// ---------------------------------------------------------------------------
 // SQL macro registration: user-facing wrappers that inject config
 // ---------------------------------------------------------------------------
 
@@ -721,6 +859,9 @@ void RegisterHttpFunctions(duckdb_connection connection) {
 	// Raw C functions (prefixed with _ — not intended for direct use)
 	RegisterHttpRawTableFunction(connection);
 	RegisterHttpRawRequestScalar(connection);
+
+	// Diagnostics
+	RegisterRateLimitStatsFunction(connection);
 
 	// SQL macros: user-facing wrappers that inject config
 	RegisterHttpMacros(connection);

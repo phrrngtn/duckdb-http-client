@@ -67,6 +67,16 @@ public:
 		return order_.size();
 	}
 
+	//! Iterate over all entries. Callback receives (const K&, V&).
+	//! Holds the lock for the duration — keep the callback fast.
+	template <typename Fn>
+	void ForEach(Fn fn) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (auto &[key, value] : order_) {
+			fn(key, value);
+		}
+	}
+
 private:
 	size_t max_size_;
 	mutable std::mutex mutex_;

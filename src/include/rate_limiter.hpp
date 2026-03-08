@@ -8,7 +8,8 @@
 
 namespace http_client {
 
-//! GCRA (Generic Cell Rate Algorithm) rate limiter.
+//! GCRA (Generic Cell Rate Algorithm) rate limiter with diagnostic counters
+//! and adaptive 429 backoff.
 //! Tracks a single timestamp (the Theoretical Arrival Time) per key.
 //! No background threads, no token counters — just one time_point and arithmetic.
 class GCRARateLimiter {
@@ -16,8 +17,10 @@ public:
 	//! Construct a rate limiter.
 	//! @param rate      requests per second
 	//! @param burst     maximum burst size (requests that can arrive at once)
-	GCRARateLimiter(double rate, double burst)
-	    : interval_(1.0 / rate), burst_offset_(interval_ * burst), tat_(std::chrono::steady_clock::now()) {
+	//! @param rate_spec original rate spec string for diagnostics
+	GCRARateLimiter(double rate, double burst, const std::string &rate_spec = "")
+	    : interval_(1.0 / rate), burst_offset_(interval_ * burst), rate_(rate), burst_(burst),
+	      rate_spec_(rate_spec), tat_(std::chrono::steady_clock::now()) {
 	}
 
 	//! Try to acquire permission for one request.
@@ -44,10 +47,58 @@ public:
 		return (wait > 0.0) ? wait : 0.0;
 	}
 
+	//! Record that a request was made (called after rate limit check, before HTTP call).
+	void RecordRequest() {
+		requests_++;
+	}
+
+	//! Record that pacing was required (the caller had to sleep).
+	//! @param wait_seconds how long the caller slept
+	void RecordPacing(double wait_seconds) {
+		paced_++;
+		total_wait_seconds_ += wait_seconds;
+	}
+
+	//! Record a 429 response and back off the TAT.
+	//! @param retry_after seconds to back off (from Retry-After header, or a default)
+	void RecordThrottle(double retry_after) {
+		throttled_429_++;
+		// Push the TAT forward so subsequent requests are delayed
+		auto now = std::chrono::steady_clock::now();
+		auto new_tat = (tat_ < now) ? now : tat_;
+		tat_ = std::chrono::time_point_cast<std::chrono::steady_clock::duration>(
+		    new_tat + std::chrono::duration<double>(retry_after));
+	}
+
+	// --- Diagnostic accessors ---
+	uint64_t Requests() const { return requests_; }
+	uint64_t Paced() const { return paced_; }
+	double TotalWaitSeconds() const { return total_wait_seconds_; }
+	uint64_t Throttled429() const { return throttled_429_; }
+	double Rate() const { return rate_; }
+	double Burst() const { return burst_; }
+	const std::string &RateSpec() const { return rate_spec_; }
+
+	//! How far ahead the TAT is from now (seconds). Positive = backlogged.
+	double BacklogSeconds() const {
+		auto now = std::chrono::steady_clock::now();
+		auto backlog = std::chrono::duration<double>(tat_ - now).count();
+		return (backlog > 0.0) ? backlog : 0.0;
+	}
+
 private:
 	double interval_;     // seconds between requests (1/rate)
 	double burst_offset_; // max burst window in seconds (interval * burst)
+	double rate_;         // requests per second (for diagnostics)
+	double burst_;        // burst capacity (for diagnostics)
+	std::string rate_spec_; // original spec string (for diagnostics)
 	std::chrono::steady_clock::time_point tat_; // theoretical arrival time
+
+	// Diagnostic counters
+	uint64_t requests_ = 0;
+	uint64_t paced_ = 0;
+	double total_wait_seconds_ = 0.0;
+	uint64_t throttled_429_ = 0;
 };
 
 //! Parse a rate limit string like "10/s", "100/m", "1000/h" into requests-per-second.
@@ -103,10 +154,17 @@ public:
 	//! @return pointer to the rate limiter (never null — the default always applies)
 	GCRARateLimiter *GetOrCreate(const std::string &host, const std::string &rate_spec = "",
 	                             double burst = DEFAULT_BURST) {
+		auto effective_spec = rate_spec.empty() ? std::string(DEFAULT_RATE_LIMIT) : rate_spec;
 		return pool_.GetOrCreate(host, [&]() {
-			double rate = ParseRateLimit(rate_spec.empty() ? DEFAULT_RATE_LIMIT : rate_spec);
-			return GCRARateLimiter(rate, burst);
+			double rate = ParseRateLimit(effective_spec);
+			return GCRARateLimiter(rate, burst, effective_spec);
 		});
+	}
+
+	//! Iterate over all active rate limiters. Callback receives (host, limiter&).
+	template <typename Fn>
+	void ForEach(Fn fn) {
+		pool_.ForEach(fn);
 	}
 
 private:
