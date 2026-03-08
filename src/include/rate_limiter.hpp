@@ -70,6 +70,23 @@ public:
 		    new_tat + std::chrono::duration<double>(retry_after));
 	}
 
+	//! Record response-level facts: elapsed time, response size, status code.
+	//! Called once per completed HTTP response.
+	void RecordResponse(double elapsed_seconds, uint64_t response_bytes, int status_code) {
+		total_elapsed_ += elapsed_seconds;
+		if (elapsed_seconds < min_elapsed_ || total_responses_ == 0) {
+			min_elapsed_ = elapsed_seconds;
+		}
+		if (elapsed_seconds > max_elapsed_) {
+			max_elapsed_ = elapsed_seconds;
+		}
+		total_response_bytes_ += response_bytes;
+		total_responses_++;
+		if (status_code < 200 || status_code >= 300) {
+			errors_++;
+		}
+	}
+
 	// --- Diagnostic accessors ---
 	uint64_t Requests() const { return requests_; }
 	uint64_t Paced() const { return paced_; }
@@ -78,6 +95,14 @@ public:
 	double Rate() const { return rate_; }
 	double Burst() const { return burst_; }
 	const std::string &RateSpec() const { return rate_spec_; }
+
+	// Response-level diagnostics
+	uint64_t TotalResponses() const { return total_responses_; }
+	uint64_t TotalResponseBytes() const { return total_response_bytes_; }
+	double TotalElapsed() const { return total_elapsed_; }
+	double MinElapsed() const { return total_responses_ > 0 ? min_elapsed_ : 0.0; }
+	double MaxElapsed() const { return max_elapsed_; }
+	uint64_t Errors() const { return errors_; }
 
 	//! How far ahead the TAT is from now (seconds). Positive = backlogged.
 	double BacklogSeconds() const {
@@ -94,17 +119,25 @@ private:
 	std::string rate_spec_; // original spec string (for diagnostics)
 	std::chrono::steady_clock::time_point tat_; // theoretical arrival time
 
-	// Diagnostic counters
+	// Diagnostic counters — rate limiting
 	uint64_t requests_ = 0;
 	uint64_t paced_ = 0;
 	double total_wait_seconds_ = 0.0;
 	uint64_t throttled_429_ = 0;
+
+	// Diagnostic counters — response facts
+	uint64_t total_responses_ = 0;
+	uint64_t total_response_bytes_ = 0;
+	double total_elapsed_ = 0.0;
+	double min_elapsed_ = 0.0;
+	double max_elapsed_ = 0.0;
+	uint64_t errors_ = 0;
 };
 
 //! Parse a rate limit string like "10/s", "100/m", "1000/h" into requests-per-second.
 //! Returns 0.0 if the string is empty (meaning no rate limit).
 inline double ParseRateLimit(const std::string &spec) {
-	if (spec.empty()) {
+	if (spec.empty() || spec == "none" || spec == "0") {
 		return 0.0;
 	}
 
@@ -155,8 +188,11 @@ public:
 	GCRARateLimiter *GetOrCreate(const std::string &host, const std::string &rate_spec = "",
 	                             double burst = DEFAULT_BURST) {
 		auto effective_spec = rate_spec.empty() ? std::string(DEFAULT_RATE_LIMIT) : rate_spec;
+		double rate = ParseRateLimit(effective_spec);
+		if (rate <= 0.0) {
+			return nullptr; // rate limiting disabled for this host
+		}
 		return pool_.GetOrCreate(host, [&]() {
-			double rate = ParseRateLimit(effective_spec);
 			return GCRARateLimiter(rate, burst, effective_spec);
 		});
 	}

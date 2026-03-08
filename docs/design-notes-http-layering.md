@@ -105,6 +105,41 @@ one that composes with the rest of SQL — it works in expressions, JOINs, and
 data-driven workflows where the set of URLs comes from a query. We provide
 both, with the table functions implemented as thin macro wrappers.
 
+## Parallel execution within scalar functions
+
+DuckDB's vectorized engine passes rows to scalar functions in chunks of up to
+2048. A naive implementation processes these one at a time — each HTTP request
+blocks until it completes before the next one starts. For a chunk of 100 rows
+hitting a server with 100ms latency, that's 10 seconds of wall-clock time.
+
+We solved this by using libcurl's multi interface (exposed through cpr's
+`MultiPerform`). The scalar function implementation has three phases:
+
+1. **Parse** — iterate over the entire input chunk, resolving configuration,
+   building cpr sessions, and acquiring rate limit tokens for each row.
+2. **Execute** — fire requests in sub-batches of `max_concurrent` (default 10)
+   using `MultiPerform::Perform()`, which runs libcurl's event loop until all
+   requests in the batch complete. No threads — the concurrency comes from
+   non-blocking socket I/O multiplexed by libcurl.
+3. **Write** — iterate over the results and assign JSON strings to the output
+   vector.
+
+This preserves the scalar function contract (one output per input row, in
+order) while achieving parallel I/O. The same 100-row chunk at 100ms latency
+completes in ~1 second (10 batches of 10) rather than 10 seconds.
+
+Rate limiting integrates naturally: tokens are acquired sequentially *before*
+each batch fires. If the rate limiter requires pacing, the sleep happens
+between batches rather than between individual requests. A 429 response from
+any request in the batch pushes the rate limiter's TAT forward, automatically
+slowing subsequent batches.
+
+The `max_concurrent` setting is per-chunk, not global. Since DuckDB pipelines
+scalar function execution on a single thread per pipeline, there is no risk of
+multiple chunks racing. If DuckDB parallelizes across multiple pipelines in the
+future, the per-host rate limiter (which uses a mutex) will serialize token
+acquisition, providing a natural concurrency gate.
+
 ## The cost of being external
 
 Building this as a C API extension means we carry a second copy of libcurl (via

@@ -32,6 +32,32 @@ static RateLimiterRegistry &GetRateLimiterRegistry() {
 	return registry;
 }
 
+//! Global rate limiter — caps total outbound requests/second across all hosts.
+//! Lazily initialized on first use; re-created if the spec changes.
+static std::mutex g_global_limiter_mutex;
+static std::unique_ptr<GCRARateLimiter> g_global_limiter;
+static std::string g_global_limiter_spec;
+
+//! Get or (re)create the global rate limiter. Returns nullptr if no global limit is configured.
+static GCRARateLimiter *GetGlobalLimiter(const std::string &spec, double burst) {
+	if (spec.empty()) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> lock(g_global_limiter_mutex);
+	if (!g_global_limiter || g_global_limiter_spec != spec) {
+		double rate = ParseRateLimit(spec);
+		g_global_limiter = std::make_unique<GCRARateLimiter>(rate, burst, spec);
+		g_global_limiter_spec = spec;
+	}
+	return g_global_limiter.get();
+}
+
+//! Snapshot the global limiter for diagnostics (returns nullptr if not configured).
+static GCRARateLimiter *GetGlobalLimiterSnapshot() {
+	std::lock_guard<std::mutex> lock(g_global_limiter_mutex);
+	return g_global_limiter.get();
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -120,7 +146,7 @@ static void DestroyInitData(void *data) {
 }
 
 // ---------------------------------------------------------------------------
-// Core: execute the HTTP request
+// Core: build sessions and execute HTTP requests
 // ---------------------------------------------------------------------------
 
 struct HttpResult {
@@ -137,56 +163,45 @@ struct HttpResult {
 	int redirect_count = 0;
 };
 
-static HttpResult ExecuteRequest(const HttpBindData &bind_data) {
-	// Resolve config from entries passed in by the SQL macro layer
-	HttpConfig config = ResolveConfig(bind_data.url, bind_data.config_entries);
+//! Map a method string to cpr::MultiPerform::HttpMethod.
+static cpr::MultiPerform::HttpMethod ToCprMethod(const std::string &method) {
+	if (method == "GET") return cpr::MultiPerform::HttpMethod::GET_REQUEST;
+	if (method == "POST") return cpr::MultiPerform::HttpMethod::POST_REQUEST;
+	if (method == "PUT") return cpr::MultiPerform::HttpMethod::PUT_REQUEST;
+	if (method == "DELETE") return cpr::MultiPerform::HttpMethod::DELETE_REQUEST;
+	if (method == "PATCH") return cpr::MultiPerform::HttpMethod::PATCH_REQUEST;
+	if (method == "HEAD") return cpr::MultiPerform::HttpMethod::HEAD_REQUEST;
+	if (method == "OPTIONS") return cpr::MultiPerform::HttpMethod::OPTIONS_REQUEST;
+	throw std::runtime_error("Unsupported HTTP method: " + method);
+}
 
-	// Apply per-call timeout override
+//! Build a configured cpr::Session from bind data and resolved config.
+//! Returns the session (as shared_ptr for MultiPerform) and the headers used (for result building).
+static std::pair<std::shared_ptr<cpr::Session>, cpr::Header>
+BuildSession(const HttpBindData &bind_data, const HttpConfig &config) {
 	int timeout = (bind_data.timeout_override >= 0) ? bind_data.timeout_override : config.timeout;
 
-	auto host = ExtractHost(bind_data.url);
+	auto session = std::make_shared<cpr::Session>();
+	session->SetUrl(cpr::Url{bind_data.url});
+	session->SetTimeout(cpr::Timeout{timeout * 1000});
 
-	// Rate limiting: wait if needed
-	auto *limiter = GetRateLimiterRegistry().GetOrCreate(host, config.rate_limit_spec, config.burst);
-	if (limiter) {
-		int max_retries = 50;
-		bool was_paced = false;
-		double total_pacing = 0.0;
-		while (!limiter->TryAcquire() && max_retries-- > 0) {
-			double wait = limiter->WaitTime();
-			if (wait > 0.0) {
-				was_paced = true;
-				total_pacing += wait;
-				std::this_thread::sleep_for(std::chrono::duration<double>(wait));
-			}
-		}
-		limiter->RecordRequest();
-		if (was_paced) {
-			limiter->RecordPacing(total_pacing);
-		}
-	}
-
-	// Build the cpr request
-	cpr::Url cpr_url{bind_data.url};
 	cpr::Header cpr_headers;
 	for (auto &[k, v] : bind_data.headers) {
 		cpr_headers[k] = v;
 	}
 
-	// Apply auth from config (only if not already set by the caller)
+	// Apply auth from config
 	if (config.auth_type == "negotiate" && cpr_headers.find("Authorization") == cpr_headers.end()) {
 		try {
 			auto neg_result = GenerateNegotiateToken(bind_data.url);
 			cpr_headers["Authorization"] = "Negotiate " + neg_result.token;
 		} catch (...) {
-			// If negotiate fails (no ticket, wrong URL scheme), proceed without it
 		}
 	} else if (config.auth_type == "bearer" && !config.bearer_token.empty() &&
 	           cpr_headers.find("Authorization") == cpr_headers.end()) {
 		cpr_headers["Authorization"] = "Bearer " + config.bearer_token;
 	}
 
-	// Content-Type for POST/PUT/PATCH
 	auto content_type = bind_data.content_type;
 	if (!bind_data.body.empty() && content_type.empty()) {
 		content_type = "application/json";
@@ -195,81 +210,45 @@ static HttpResult ExecuteRequest(const HttpBindData &bind_data) {
 		cpr_headers["Content-Type"] = content_type;
 	}
 
-	// Build session
-	cpr::Session session;
-	session.SetUrl(cpr_url);
-	session.SetHeader(cpr_headers);
-	session.SetTimeout(cpr::Timeout{timeout * 1000});
+	session->SetHeader(cpr_headers);
 
 	bool verify_ssl = (bind_data.verify_ssl_override >= 0) ? (bind_data.verify_ssl_override == 1) : config.verify_ssl;
 	if (!verify_ssl) {
-		session.SetVerifySsl(cpr::VerifySsl{false});
+		session->SetVerifySsl(cpr::VerifySsl{false});
 	}
 	if (!config.ca_bundle.empty()) {
 		cpr::SslOptions ssl_opts;
 		ssl_opts.SetOption(cpr::ssl::CaInfo{config.ca_bundle});
-		session.SetSslOptions(ssl_opts);
+		session->SetSslOptions(ssl_opts);
 	}
 	if (!config.proxy.empty()) {
-		session.SetProxies(cpr::Proxies{{"http", config.proxy}, {"https", config.proxy}});
+		session->SetProxies(cpr::Proxies{{"http", config.proxy}, {"https", config.proxy}});
 	}
 
-	// Query params (for GET)
 	if (!bind_data.params.empty()) {
 		cpr::Parameters cpr_params;
 		for (auto &[k, v] : bind_data.params) {
 			cpr_params.Add(cpr::Parameter{k, v});
 		}
-		session.SetParameters(cpr_params);
+		session->SetParameters(cpr_params);
 	}
 
-	// Body (for POST/PUT/PATCH)
 	if (!bind_data.body.empty()) {
-		session.SetBody(cpr::Body{bind_data.body});
+		session->SetBody(cpr::Body{bind_data.body});
 	}
 
-	// Execute the appropriate method
-	cpr::Response response;
-	auto method = bind_data.method;
-	if (method == "GET") {
-		response = session.Get();
-	} else if (method == "POST") {
-		response = session.Post();
-	} else if (method == "PUT") {
-		response = session.Put();
-	} else if (method == "DELETE") {
-		response = session.Delete();
-	} else if (method == "PATCH") {
-		response = session.Patch();
-	} else if (method == "HEAD") {
-		response = session.Head();
-	} else if (method == "OPTIONS") {
-		response = session.Options();
-	} else {
-		throw std::runtime_error("Unsupported HTTP method: " + method);
-	}
+	return {session, cpr_headers};
+}
 
-	// If the server returned 429 Too Many Requests, feed back to the rate limiter
-	if (response.status_code == 429 && limiter) {
-		double retry_after = 1.0; // default backoff
-		auto it = response.header.find("Retry-After");
-		if (it != response.header.end()) {
-			try {
-				retry_after = std::stod(it->second);
-			} catch (...) {
-				// Retry-After might be a date string — fall back to default
-			}
-		}
-		limiter->RecordThrottle(retry_after);
-	}
-
-	// Build result
+//! Convert a cpr::Response into an HttpResult.
+static HttpResult ResponseToResult(const cpr::Response &response, const HttpBindData &bind_data,
+                                   const cpr::Header &req_headers) {
 	HttpResult result;
 	result.request_url = bind_data.url;
-	result.request_method = method;
+	result.request_method = bind_data.method;
 
 	nlohmann::json req_headers_json = nlohmann::json::object();
-	for (auto &[k, v] : cpr_headers) {
+	for (auto &[k, v] : req_headers) {
 		req_headers_json[k] = v;
 	}
 	result.request_headers_json = req_headers_json.dump();
@@ -284,6 +263,80 @@ static HttpResult ExecuteRequest(const HttpBindData &bind_data) {
 	result.redirect_count = static_cast<int>(response.redirect_count);
 
 	return result;
+}
+
+//! Acquire a rate limit token from the given limiter, sleeping if necessary.
+//! Records pacing stats on the limiter.
+static void AcquireRateLimit(GCRARateLimiter *limiter) {
+	if (!limiter) return;
+	int max_retries = 50;
+	bool was_paced = false;
+	double total_pacing = 0.0;
+	while (!limiter->TryAcquire() && max_retries-- > 0) {
+		double wait = limiter->WaitTime();
+		if (wait > 0.0) {
+			was_paced = true;
+			total_pacing += wait;
+			std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+		}
+	}
+	limiter->RecordRequest();
+	if (was_paced) {
+		limiter->RecordPacing(total_pacing);
+	}
+}
+
+//! Record response facts and handle 429 feedback.
+static void RecordResponseStats(const cpr::Response &response, const std::string &host) {
+	auto *limiter = GetRateLimiterRegistry().GetOrCreate(host);
+	if (!limiter) return;
+
+	limiter->RecordResponse(response.elapsed, response.text.size(),
+	                        static_cast<int>(response.status_code));
+
+	if (response.status_code == 429) {
+		double retry_after = 1.0;
+		auto it = response.header.find("Retry-After");
+		if (it != response.header.end()) {
+			try { retry_after = std::stod(it->second); } catch (...) {}
+		}
+		limiter->RecordThrottle(retry_after);
+	}
+
+	// Record on the global limiter too, if active
+	auto *global = GetGlobalLimiterSnapshot();
+	if (global) {
+		global->RecordResponse(response.elapsed, response.text.size(),
+		                       static_cast<int>(response.status_code));
+	}
+}
+
+//! Execute a single HTTP request (used by table functions).
+//! Handles rate limiting, session building, execution, and 429 feedback.
+static HttpResult ExecuteRequest(const HttpBindData &bind_data) {
+	HttpConfig config = ResolveConfig(bind_data.url, bind_data.config_entries);
+	auto host = ExtractHost(bind_data.url);
+
+	// Rate limiting: global first, then per-host
+	AcquireRateLimit(GetGlobalLimiter(config.global_rate_limit_spec, config.global_burst));
+	AcquireRateLimit(GetRateLimiterRegistry().GetOrCreate(host, config.rate_limit_spec, config.burst));
+
+	auto [session, req_headers] = BuildSession(bind_data, config);
+
+	// Execute
+	cpr::Response response;
+	auto method = bind_data.method;
+	if (method == "GET") { response = session->Get(); }
+	else if (method == "POST") { response = session->Post(); }
+	else if (method == "PUT") { response = session->Put(); }
+	else if (method == "DELETE") { response = session->Delete(); }
+	else if (method == "PATCH") { response = session->Patch(); }
+	else if (method == "HEAD") { response = session->Head(); }
+	else if (method == "OPTIONS") { response = session->Options(); }
+	else { throw std::runtime_error("Unsupported HTTP method: " + method); }
+
+	RecordResponseStats(response, host);
+	return ResponseToResult(response, bind_data, req_headers);
 }
 
 // ---------------------------------------------------------------------------
@@ -549,8 +602,26 @@ static std::string ReadVarchar(duckdb_vector vec, uint64_t *validity, idx_t row)
 	return std::string(str, len);
 }
 
+//! Convert an HttpResult to a JSON string for the scalar function output.
+static std::string ResultToJson(const HttpResult &result) {
+	nlohmann::json j;
+	j["request_url"] = result.request_url;
+	j["request_method"] = result.request_method;
+	j["request_headers"] = nlohmann::json::parse(result.request_headers_json);
+	j["request_body"] = result.request_body;
+	j["response_status_code"] = result.response_status_code;
+	j["response_status"] = result.response_status;
+	j["response_headers"] = nlohmann::json::parse(result.response_headers_json);
+	j["response_body"] = result.response_body;
+	j["response_url"] = result.response_url;
+	j["elapsed"] = result.elapsed;
+	j["redirect_count"] = result.redirect_count;
+	return j.dump();
+}
+
 static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
 	idx_t input_size = duckdb_data_chunk_get_size(input);
+	if (input_size == 0) return;
 
 	duckdb_vector method_vec = duckdb_data_chunk_get_vector(input, 0);
 	duckdb_vector url_vec = duckdb_data_chunk_get_vector(input, 1);
@@ -565,6 +636,19 @@ static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chun
 	auto *body_validity = duckdb_vector_get_validity(body_vec);
 	auto *ct_validity = duckdb_vector_get_validity(ct_vec);
 	auto *config_validity = duckdb_vector_get_validity(config_vec);
+
+	// --- Phase 1: Parse all rows into bind data and resolve configs ---
+	struct RowRequest {
+		HttpBindData bind_data;
+		HttpConfig config;
+		std::string host;
+		std::shared_ptr<cpr::Session> session;
+		cpr::Header req_headers;
+		cpr::MultiPerform::HttpMethod cpr_method;
+	};
+	std::vector<RowRequest> rows(input_size);
+
+	int max_concurrent = 10; // default; will be overridden by first row's config
 
 	for (idx_t row = 0; row < input_size; row++) {
 		auto method = ReadVarchar(method_vec, method_validity, row);
@@ -584,36 +668,75 @@ static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chun
 		auto content_type = ReadVarchar(ct_vec, ct_validity, row);
 		auto config_json = ReadVarchar(config_vec, config_validity, row);
 
-		HttpBindData bind_data;
-		bind_data.method = method;
-		bind_data.url = url;
-		bind_data.headers = ParseJsonObject(headers_str.c_str(), headers_str.size());
-		bind_data.body = body;
-		bind_data.content_type = content_type;
-		bind_data.config_entries = ParseJsonObject(config_json.c_str(), config_json.size());
+		auto &req = rows[row];
+		req.bind_data.method = method;
+		req.bind_data.url = url;
+		req.bind_data.headers = ParseJsonObject(headers_str.c_str(), headers_str.size());
+		req.bind_data.body = body;
+		req.bind_data.content_type = content_type;
+		req.bind_data.config_entries = ParseJsonObject(config_json.c_str(), config_json.size());
 
-		HttpResult result;
+		req.config = ResolveConfig(url, req.bind_data.config_entries);
+		req.host = ExtractHost(url);
+
 		try {
-			result = ExecuteRequest(bind_data);
+			req.cpr_method = ToCprMethod(method);
+			auto [session, headers] = BuildSession(req.bind_data, req.config);
+			req.session = session;
+			req.req_headers = headers;
 		} catch (const std::exception &e) {
 			duckdb_scalar_function_set_error(info, e.what());
 			return;
 		}
 
-		nlohmann::json j;
-		j["request_url"] = result.request_url;
-		j["request_method"] = result.request_method;
-		j["request_headers"] = nlohmann::json::parse(result.request_headers_json);
-		j["request_body"] = result.request_body;
-		j["response_status_code"] = result.response_status_code;
-		j["response_status"] = result.response_status;
-		j["response_headers"] = nlohmann::json::parse(result.response_headers_json);
-		j["response_body"] = result.response_body;
-		j["response_url"] = result.response_url;
-		j["elapsed"] = result.elapsed;
-		j["redirect_count"] = result.redirect_count;
+		if (row == 0) {
+			max_concurrent = req.config.max_concurrent;
+		}
+	}
 
-		auto json_str = j.dump();
+	// --- Phase 2: Execute in batches using MultiPerform ---
+	// Process in sub-batches of max_concurrent, rate-limiting between batches.
+	std::vector<HttpResult> results(input_size);
+
+	for (idx_t batch_start = 0; batch_start < input_size; batch_start += max_concurrent) {
+		idx_t batch_end = std::min(batch_start + (idx_t)max_concurrent, input_size);
+		idx_t batch_size = batch_end - batch_start;
+
+		// Rate-limit: global first, then per-host, for each request in this batch
+		for (idx_t i = batch_start; i < batch_end; i++) {
+			AcquireRateLimit(GetGlobalLimiter(
+			    rows[i].config.global_rate_limit_spec, rows[i].config.global_burst));
+			AcquireRateLimit(GetRateLimiterRegistry().GetOrCreate(
+			    rows[i].host, rows[i].config.rate_limit_spec, rows[i].config.burst));
+		}
+
+		// Build MultiPerform for this batch
+		cpr::MultiPerform multi;
+		for (idx_t i = batch_start; i < batch_end; i++) {
+			multi.AddSession(rows[i].session, rows[i].cpr_method);
+		}
+
+		// Execute all requests in this batch concurrently
+		std::vector<cpr::Response> responses;
+		try {
+			responses = multi.Perform();
+		} catch (const std::exception &e) {
+			duckdb_scalar_function_set_error(info, e.what());
+			return;
+		}
+
+		// Collect results and record stats
+		for (idx_t i = 0; i < batch_size; i++) {
+			idx_t row_idx = batch_start + i;
+			RecordResponseStats(responses[i], rows[row_idx].host);
+			results[row_idx] = ResponseToResult(
+			    responses[i], rows[row_idx].bind_data, rows[row_idx].req_headers);
+		}
+	}
+
+	// --- Phase 3: Write results to output vector ---
+	for (idx_t row = 0; row < input_size; row++) {
+		auto json_str = ResultToJson(results[row]);
 		duckdb_vector_assign_string_element_len(output, row, json_str.c_str(), json_str.length());
 	}
 }
@@ -637,6 +760,7 @@ static void RegisterHttpRawRequestScalar(duckdb_connection connection) {
 
 	duckdb_scalar_function_set_function(function, HttpRawRequestScalarFunc);
 	duckdb_scalar_function_set_special_handling(function);
+	duckdb_scalar_function_set_volatile(function);
 
 	duckdb_register_scalar_function(connection, function);
 	duckdb_destroy_scalar_function(&function);
@@ -658,6 +782,13 @@ struct RateLimitStatsData {
 		double total_wait_seconds;
 		uint64_t throttled_429;
 		double backlog_seconds;
+		// Response facts
+		uint64_t total_responses;
+		uint64_t total_response_bytes;
+		double total_elapsed;
+		double min_elapsed;
+		double max_elapsed;
+		uint64_t errors;
 	};
 	std::vector<HostStats> rows;
 	idx_t current_row = 0;
@@ -670,9 +801,21 @@ static void DestroyRateLimitStatsData(void *data) {
 static void RateLimitStatsBind(duckdb_bind_info info) {
 	// Snapshot the stats at bind time
 	auto *data = new RateLimitStatsData();
+	auto snapshot = [](const std::string &host, GCRARateLimiter &limiter) -> RateLimitStatsData::HostStats {
+		return {host, limiter.RateSpec(), limiter.Rate(), limiter.Burst(), limiter.Requests(),
+		    limiter.Paced(), limiter.TotalWaitSeconds(), limiter.Throttled429(), limiter.BacklogSeconds(),
+		    limiter.TotalResponses(), limiter.TotalResponseBytes(), limiter.TotalElapsed(),
+		    limiter.MinElapsed(), limiter.MaxElapsed(), limiter.Errors()};
+	};
+
+	// Include the global limiter as a special "(global)" row if configured
+	auto *global = GetGlobalLimiterSnapshot();
+	if (global) {
+		data->rows.push_back(snapshot("(global)", *global));
+	}
+
 	GetRateLimiterRegistry().ForEach([&](const std::string &host, GCRARateLimiter &limiter) {
-		data->rows.push_back({host, limiter.RateSpec(), limiter.Rate(), limiter.Burst(), limiter.Requests(),
-		    limiter.Paced(), limiter.TotalWaitSeconds(), limiter.Throttled429(), limiter.BacklogSeconds()});
+		data->rows.push_back(snapshot(host, limiter));
 	});
 
 	duckdb_logical_type varchar_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
@@ -688,6 +831,12 @@ static void RateLimitStatsBind(duckdb_bind_info info) {
 	duckdb_bind_add_result_column(info, "total_wait_seconds", double_type);
 	duckdb_bind_add_result_column(info, "throttled_429", bigint_type);
 	duckdb_bind_add_result_column(info, "backlog_seconds", double_type);
+	duckdb_bind_add_result_column(info, "total_responses", bigint_type);
+	duckdb_bind_add_result_column(info, "total_response_bytes", bigint_type);
+	duckdb_bind_add_result_column(info, "total_elapsed", double_type);
+	duckdb_bind_add_result_column(info, "min_elapsed", double_type);
+	duckdb_bind_add_result_column(info, "max_elapsed", double_type);
+	duckdb_bind_add_result_column(info, "errors", bigint_type);
 
 	duckdb_destroy_logical_type(&varchar_type);
 	duckdb_destroy_logical_type(&bigint_type);
@@ -720,6 +869,12 @@ static void RateLimitStatsExecute(duckdb_function_info info, duckdb_data_chunk o
 	duckdb_vector wait_vec = duckdb_data_chunk_get_vector(output, 6);
 	duckdb_vector throttled_vec = duckdb_data_chunk_get_vector(output, 7);
 	duckdb_vector backlog_vec = duckdb_data_chunk_get_vector(output, 8);
+	duckdb_vector total_resp_vec = duckdb_data_chunk_get_vector(output, 9);
+	duckdb_vector total_bytes_vec = duckdb_data_chunk_get_vector(output, 10);
+	duckdb_vector total_elapsed_vec = duckdb_data_chunk_get_vector(output, 11);
+	duckdb_vector min_elapsed_vec = duckdb_data_chunk_get_vector(output, 12);
+	duckdb_vector max_elapsed_vec = duckdb_data_chunk_get_vector(output, 13);
+	duckdb_vector errors_vec = duckdb_data_chunk_get_vector(output, 14);
 
 	auto *rate_rps_data = (double *)duckdb_vector_get_data(rate_rps_vec);
 	auto *burst_data = (double *)duckdb_vector_get_data(burst_vec);
@@ -728,6 +883,12 @@ static void RateLimitStatsExecute(duckdb_function_info info, duckdb_data_chunk o
 	auto *wait_data = (double *)duckdb_vector_get_data(wait_vec);
 	auto *throttled_data = (int64_t *)duckdb_vector_get_data(throttled_vec);
 	auto *backlog_data = (double *)duckdb_vector_get_data(backlog_vec);
+	auto *total_resp_data = (int64_t *)duckdb_vector_get_data(total_resp_vec);
+	auto *total_bytes_data = (int64_t *)duckdb_vector_get_data(total_bytes_vec);
+	auto *total_elapsed_data = (double *)duckdb_vector_get_data(total_elapsed_vec);
+	auto *min_elapsed_data = (double *)duckdb_vector_get_data(min_elapsed_vec);
+	auto *max_elapsed_data = (double *)duckdb_vector_get_data(max_elapsed_vec);
+	auto *errors_data = (int64_t *)duckdb_vector_get_data(errors_vec);
 
 	for (idx_t i = 0; i < count; i++) {
 		auto &row = data->rows[data->current_row + i];
@@ -740,6 +901,12 @@ static void RateLimitStatsExecute(duckdb_function_info info, duckdb_data_chunk o
 		wait_data[i] = row.total_wait_seconds;
 		throttled_data[i] = static_cast<int64_t>(row.throttled_429);
 		backlog_data[i] = row.backlog_seconds;
+		total_resp_data[i] = static_cast<int64_t>(row.total_responses);
+		total_bytes_data[i] = static_cast<int64_t>(row.total_response_bytes);
+		total_elapsed_data[i] = row.total_elapsed;
+		min_elapsed_data[i] = row.min_elapsed;
+		max_elapsed_data[i] = row.max_elapsed;
+		errors_data[i] = static_cast<int64_t>(row.errors);
 	}
 
 	data->current_row += count;
@@ -843,11 +1010,13 @@ void RegisterHttpMacros(duckdb_connection connection) {
 		"body := body, content_type := content_type, "
 		"timeout := timeout, verify_ssl := verify_ssl, _config := _http_config())");
 
-	// Scalar macro: http_request(method, url, headers_json, body, content_type)
-	// Wraps _http_raw_request, injecting config as the 6th parameter.
+	// Scalar macro: http_request(method, url, ...)
+	// Named optional params with defaults, wraps _http_raw_request with config injection.
 	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_request(method, url, headers_json, body, content_type) AS "
-		"_http_raw_request(method, url, headers_json, body, content_type, "
+		"CREATE OR REPLACE MACRO http_request(method, url, "
+		"headers := NULL::VARCHAR, body := NULL::VARCHAR, "
+		"content_type := NULL::VARCHAR) AS "
+		"_http_raw_request(method, url, headers, body, content_type, "
 		"CAST(_http_config() AS JSON))");
 }
 

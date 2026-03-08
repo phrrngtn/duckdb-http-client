@@ -113,24 +113,35 @@ All table functions return the same schema:
 | `timeout` | INTEGER | all | Request timeout in seconds (overrides config) |
 | `verify_ssl` | BOOLEAN | all | SSL certificate verification (overrides config) |
 
-### Scalar function: `http_request(method, url, headers_json, body, content_type)`
+### Scalar function: `http_request(method, url, [headers, body, content_type])`
 
 Returns a JSON string containing the full request/response envelope. This is
 the function to use for data-driven workflows where URLs come from a query.
+The function is marked `VOLATILE` — it will be called for every row even when
+all arguments are identical.
 
 ```sql
--- Basic usage
+-- Basic GET — no trailing NULLs needed
 SELECT json_extract(
-    http_request('GET', 'https://httpbin.org/get', NULL, NULL, NULL),
+    http_request('GET', 'https://httpbin.org/get'),
     '$.response_status_code'
 )::INTEGER AS status;
+```
+
+```sql
+-- POST with named parameters
+SELECT json_extract(
+    http_request('POST', 'https://httpbin.org/post',
+        body := '{"name": "duckdb"}',
+        content_type := 'application/json'),
+    '$.response_status_code')::INTEGER AS status;
 ```
 
 ```sql
 -- Data-driven: fetch from a list of URLs
 SELECT
     url,
-    json_extract(http_request('GET', url, NULL, NULL, NULL),
+    json_extract(http_request('GET', url),
         '$.response_status_code')::INTEGER AS status
 FROM (VALUES
     ('https://httpbin.org/get'),
@@ -143,7 +154,7 @@ ORDER BY url;
 -- With headers as a JSON string
 SELECT json_extract_string(
     http_request('GET', 'https://httpbin.org/get',
-        '{"Authorization": "Bearer my-token"}', NULL, NULL),
+        headers := '{"Authorization": "Bearer my-token"}'),
     '$.response_body')
 AS body;
 ```
@@ -153,12 +164,20 @@ AS body;
 SELECT
     e.endpoint_url,
     json_extract(
-        http_request('GET', e.endpoint_url, NULL, NULL, NULL),
+        http_request('GET', e.endpoint_url),
         '$.response_status_code')::INTEGER AS status
 FROM endpoints AS e
 LEFT OUTER JOIN health_checks AS h ON h.url = e.endpoint_url
 WHERE h.url IS NULL;
 ```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `method` | VARCHAR | (required) | HTTP method |
+| `url` | VARCHAR | (required) | Request URL |
+| `headers` | VARCHAR (JSON) | NULL | Request headers as JSON object |
+| `body` | VARCHAR | NULL | Request body |
+| `content_type` | VARCHAR | NULL | Content-Type (defaults to `application/json` if body is set) |
 
 ## Configuration
 
@@ -180,13 +199,16 @@ SET VARIABLE http_config = MAP {
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `timeout` | integer | 30 | Request timeout in seconds |
-| `rate_limit` | string | `"20/s"` | Rate limit (`"10/s"`, `"100/m"`, `"3600/h"`) |
+| `rate_limit` | string | `"20/s"` | Rate limit (`"10/s"`, `"100/m"`, `"3600/h"`, `"none"` to disable) |
 | `burst` | number | 5.0 | Burst capacity for rate limiter |
 | `verify_ssl` | boolean | true | Verify SSL certificates |
 | `proxy` | string | | HTTP/HTTPS proxy URL |
 | `ca_bundle` | string | | Path to CA certificate bundle |
 | `auth_type` | string | | `"negotiate"` or `"bearer"` |
 | `bearer_token` | string | | Token for Bearer authentication |
+| `max_concurrent` | integer | 10 | Max parallel requests per scalar function chunk |
+| `global_rate_limit` | string | | Aggregate rate limit across all hosts (e.g. `"50/s"`) |
+| `global_burst` | number | 10.0 | Burst capacity for the global rate limiter |
 
 ### How configuration flows
 
@@ -227,6 +249,116 @@ SET VARIABLE http_config = MAP {
     'default': '{"rate_limit": "20/s"}',
     'https://rate-limited-api.com/': '{"rate_limit": "2/s"}'
 };
+```
+
+### Parallel execution
+
+The scalar function `http_request` executes requests in parallel using
+libcurl's multi interface (via cpr's `MultiPerform`). When DuckDB passes a
+chunk of rows to the scalar function, the extension fires up to
+`max_concurrent` requests simultaneously, then moves to the next batch.
+
+```sql
+-- Default: up to 10 concurrent requests per chunk
+SELECT json_extract(
+    http_request('GET', 'http://api.example.com/item/' || id::VARCHAR, NULL, NULL, NULL),
+    '$.response_status_code')::INTEGER AS status
+FROM range(100) AS t(id);
+```
+
+```sql
+-- Throttle to 3 concurrent requests
+SET VARIABLE http_config = MAP {
+    'default': '{"max_concurrent": 3}'
+};
+
+SELECT json_extract(
+    http_request('GET', 'http://api.example.com/item/' || id::VARCHAR, NULL, NULL, NULL),
+    '$.response_status_code')::INTEGER AS status
+FROM range(100) AS t(id);
+```
+
+DuckDB's vectorized engine passes rows to scalar functions in chunks (up to
+2048 rows). Within each chunk, the extension:
+
+1. **Parses** all rows — resolves config, builds sessions, acquires rate limit tokens
+2. **Executes** in sub-batches of `max_concurrent` via `MultiPerform` (libcurl event loop — no threads)
+3. **Writes** all results back to the output vector
+
+Rate limiting is enforced *before* each batch: the extension acquires one rate
+limit token per request, sleeping if necessary, then fires the batch. If a
+server responds with 429, the rate limiter's TAT (Theoretical Arrival Time) is
+pushed forward by the `Retry-After` value, automatically slowing subsequent
+batches.
+
+Table functions (`http_get`, `http_post`, etc.) execute one request at a time
+since they return a single row per invocation. Use the scalar function for
+data-driven workloads where parallelism matters.
+
+### Rate limiter diagnostics
+
+The `http_rate_limit_stats()` table function returns a snapshot of per-host
+rate limiter state. Call it after running requests to see how the rate limiter
+behaved.
+
+```sql
+SELECT * FROM http_rate_limit_stats();
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `host` | VARCHAR | Hostname key |
+| `rate_limit` | VARCHAR | Configured rate spec (e.g. `20/s`) |
+| `rate_rps` | DOUBLE | Requests per second (parsed) |
+| `burst` | DOUBLE | Burst capacity |
+| `requests` | BIGINT | Total requests recorded |
+| `paced` | BIGINT | Times the caller had to sleep before sending |
+| `total_wait_seconds` | DOUBLE | Cumulative time spent waiting for rate limit tokens |
+| `throttled_429` | BIGINT | Times a 429 response pushed back the rate limiter |
+| `backlog_seconds` | DOUBLE | How far ahead the TAT is from now (positive = backlogged) |
+| `total_responses` | BIGINT | Total HTTP responses received |
+| `total_response_bytes` | BIGINT | Total response body bytes received |
+| `total_elapsed` | DOUBLE | Sum of all request durations (seconds) |
+| `min_elapsed` | DOUBLE | Fastest request (seconds) |
+| `max_elapsed` | DOUBLE | Slowest request (seconds) |
+| `errors` | BIGINT | Responses with non-2xx status codes |
+
+When a `global_rate_limit` is configured, a `(global)` row appears with
+aggregate counts across all hosts.
+
+Example workflow:
+
+```sql
+-- Fire some requests
+SELECT count(*) FROM (
+    SELECT http_request('GET', 'http://localhost:8444/fast', NULL, NULL, NULL) AS r
+    FROM range(50) AS t(id)
+);
+
+-- Inspect rate limiter and request stats
+SELECT host, requests, total_responses, total_response_bytes,
+       round(total_elapsed, 3) AS total_s,
+       round(min_elapsed, 4) AS min_s,
+       round(max_elapsed, 4) AS max_s,
+       errors, paced, throttled_429
+FROM http_rate_limit_stats();
+```
+
+Example with a global rate limiter:
+
+```sql
+SET VARIABLE http_config = MAP {
+    'default': '{"global_rate_limit": "10/s", "rate_limit": "100/s", "max_concurrent": 5}'
+};
+
+SELECT json_extract(
+    http_request('GET', 'http://api.example.com/item/' || id::VARCHAR, NULL, NULL, NULL),
+    '$.response_status_code')::INTEGER AS status
+FROM range(15) AS t(id);
+
+SELECT * FROM http_rate_limit_stats();
+-- (global)   | 15 requests | 1955 bytes | paced=1 | pacing_s=0.986
+-- localhost  | 15 requests | 1955 bytes | paced=0
 ```
 
 ## Negotiate (SPNEGO/Kerberos) Authentication
@@ -317,6 +449,120 @@ DuckDB to load it.
 
 ```bash
 make test_release
+```
+
+The sqllogictest suite (`test/sql/http_client.test`) covers error cases for
+Negotiate auth, table functions against httpbin.org, and scalar function usage
+including data-driven queries.
+
+### Concurrency testing with the Flask server
+
+A Flask server (`test/flask_concurrency_server.py`) instruments concurrent
+connections to verify parallel execution behavior. It tracks per-request
+arrival/departure times, thread identity, and peak concurrency.
+
+```bash
+# Terminal 1: start the concurrency test server
+python3 test/flask_concurrency_server.py
+# Listens on http://localhost:8444
+```
+
+Endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /slow/<path>?delay=0.5` | Responds after a configurable delay (default 0.5s). Tracks concurrency. |
+| `GET /fast` | Responds immediately. For throughput measurement. |
+| `GET /stats` | Returns JSON with `total_requests`, `peak_concurrent_connections`, and per-request log. |
+| `GET /reset` | Resets all counters and logs. |
+| `GET /health` | Health check. |
+
+#### Verify parallel execution
+
+```bash
+# Terminal 2: reset and run 10 requests with 0.3s delay each
+curl -s http://localhost:8444/reset > /dev/null
+
+duckdb -unsigned -cmd "LOAD 'build/release/http_client.duckdb_extension';" -c "
+SELECT id,
+       json_extract(http_request('GET',
+           'http://localhost:8444/slow/' || id::VARCHAR || '?delay=0.3',
+           NULL, NULL, NULL), '\$.response_status_code')::INTEGER AS status
+FROM range(10) AS t(id);
+"
+
+# Check what the server saw
+curl -s http://localhost:8444/stats | python3 -m json.tool
+```
+
+With the default `max_concurrent=10`, all 10 requests arrive within
+milliseconds of each other (wall-clock time ~0.3s, not 3.0s). The server
+reports `peak_concurrent_connections: 10`.
+
+#### Verify batching with max_concurrent
+
+```bash
+curl -s http://localhost:8444/reset > /dev/null
+
+duckdb -unsigned -cmd "LOAD 'build/release/http_client.duckdb_extension';" -c "
+SET VARIABLE http_config = MAP {
+    'default': '{\"max_concurrent\": 3, \"rate_limit\": \"100/s\"}'
+};
+
+SELECT id,
+       json_extract(http_request('GET',
+           'http://localhost:8444/slow/' || id::VARCHAR || '?delay=0.3',
+           NULL, NULL, NULL), '\$.response_status_code')::INTEGER AS status
+FROM range(10) AS t(id);
+"
+
+curl -s http://localhost:8444/stats | python3 -m json.tool
+```
+
+The server reports `peak_concurrent_connections: 3`. Requests arrive in 4
+batches of sizes [3, 3, 3, 1], with ~0.3s between batches (total wall-clock
+~1.2s). This confirms that `max_concurrent` correctly limits parallelism.
+
+#### Analyze batch timing
+
+A quick script to summarize arrival batches from the server stats:
+
+```bash
+curl -s http://localhost:8444/stats | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(f'Total requests: {data[\"total_requests\"]}')
+print(f'Peak concurrent: {data[\"peak_concurrent_connections\"]}')
+arrivals = sorted(r['arrived'] for r in data['request_log'])
+print(f'Arrival span: {arrivals[-1] - arrivals[0]:.3f}s')
+batches, batch = [], [arrivals[0]]
+for a in arrivals[1:]:
+    if a - batch[0] < 0.05:
+        batch.append(a)
+    else:
+        batches.append(batch)
+        batch = [a]
+batches.append(batch)
+print(f'Batches: {len(batches)} (sizes: {[len(b) for b in batches]})')
+"
+```
+
+#### Verify rate limiter diagnostics after testing
+
+```bash
+duckdb -unsigned -cmd "LOAD 'build/release/http_client.duckdb_extension';" -c "
+-- Run some requests first
+SELECT count(*) FROM (
+    SELECT http_request('GET', 'http://localhost:8444/fast', NULL, NULL, NULL)
+    FROM range(20) AS t(id)
+);
+
+-- Inspect rate limiter
+SELECT host, rate_limit, requests, paced, throttled_429,
+       round(total_wait_seconds, 3) AS wait_s,
+       round(backlog_seconds, 3) AS backlog_s
+FROM http_rate_limit_stats();
+"
 ```
 
 ### Manual testing with the Flask negotiate server

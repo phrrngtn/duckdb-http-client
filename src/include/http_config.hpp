@@ -17,6 +17,9 @@ struct HttpConfig {
 	std::string ca_bundle;         // empty = system default
 	std::string auth_type;         // "negotiate", "bearer", or empty
 	std::string bearer_token;      // for auth_type=bearer
+	int max_concurrent = 10;       // max parallel requests in a scalar function chunk
+	std::string global_rate_limit_spec; // empty = no global limit; only meaningful from "default" scope
+	double global_burst = 10.0;
 
 	//! Apply values from a JSON config object, overwriting only fields that are present.
 	void MergeFrom(const nlohmann::json &j) {
@@ -43,6 +46,16 @@ struct HttpConfig {
 		}
 		if (j.contains("bearer_token") && j["bearer_token"].is_string()) {
 			bearer_token = j["bearer_token"].get<std::string>();
+		}
+		if (j.contains("max_concurrent") && j["max_concurrent"].is_number()) {
+			max_concurrent = j["max_concurrent"].get<int>();
+			if (max_concurrent < 1) max_concurrent = 1;
+		}
+		if (j.contains("global_rate_limit") && j["global_rate_limit"].is_string()) {
+			global_rate_limit_spec = j["global_rate_limit"].get<std::string>();
+		}
+		if (j.contains("global_burst") && j["global_burst"].is_number()) {
+			global_burst = j["global_burst"].get<double>();
 		}
 	}
 };
