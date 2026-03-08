@@ -56,11 +56,28 @@ set(CPR_BUILD_TESTS OFF CACHE INTERNAL "")
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(cpr)
 
+###
+# Embed SQL macros as C++ string constants
+###
+file(GLOB SQL_FILES ${CMAKE_SOURCE_DIR}/sql/*.sql)
+set(SQL_RESOURCES_HEADER ${CMAKE_BINARY_DIR}/sql_resources.hpp)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_custom_command(
+    OUTPUT ${SQL_RESOURCES_HEADER}
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/cmake/embed_sql.py
+        ${CMAKE_SOURCE_DIR}/sql
+        ${SQL_RESOURCES_HEADER}
+    DEPENDS ${SQL_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_sql.py
+    COMMENT "Embedding SQL macros into sql_resources.hpp"
+)
+
 # Extension sources
 set(EXTENSION_SOURCES
         src/http_client_extension.cpp
         src/http_functions.cpp
         src/negotiate_auth.cpp
+        ${SQL_RESOURCES_HEADER}
 )
 
 if (DUCKDB_WASM_EXTENSION)
@@ -76,8 +93,8 @@ set(VISIBILITY_INLINES_HIDDEN ON)
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -s")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -s")
 
-# Include own headers
-target_include_directories(${EXTENSION_NAME} PRIVATE src/include)
+# Include own headers and generated headers
+target_include_directories(${EXTENSION_NAME} PRIVATE src/include ${CMAKE_BINARY_DIR})
 
 # Include DuckDB C API headers
 target_include_directories(${EXTENSION_NAME} PRIVATE duckdb_capi)

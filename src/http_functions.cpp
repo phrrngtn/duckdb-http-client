@@ -14,6 +14,8 @@
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 
+#include "sql_resources.hpp"
+
 DUCKDB_EXTENSION_EXTERN
 
 namespace http_client {
@@ -800,134 +802,21 @@ static void TryRegisterMacro(duckdb_connection connection, const char *sql) {
 }
 
 void RegisterHttpMacros(duckdb_connection connection) {
-	// Helper macro to safely read the http_config variable.
-	// Returns an empty MAP if the variable is not set.
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO _http_config() AS "
-		"IFNULL(TRY_CAST(getvariable('http_config') AS MAP(VARCHAR, VARCHAR)), MAP {})");
-
-	// --- Scalar macros ---
-	// Per-verb scalar macros route to the idempotent or volatile C function
-	// based on HTTP method semantics. All return STRUCT.
-	// Use CTE/subquery pattern to access fields: SELECT r.field FROM (SELECT http_get(url) AS r)
-
-	// Idempotent verbs: safe to deduplicate identical calls within a query.
-	// GET, HEAD, OPTIONS are read-only; PUT and DELETE are idempotent by spec.
-	// Headers are MAP(VARCHAR, VARCHAR) — passed directly to the C function.
-	// Config is a JSON string — the macro reads _http_config() and casts to JSON
-	// for the C function, which uses nlohmann to parse the (potentially nested)
-	// per-scope config values.
-	const char *idempotent_scalar_macros[] = {
-		"CREATE OR REPLACE MACRO http_get(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR)) AS "
-		"_http_raw_request('GET', url, headers, NULL, NULL, "
-		"CAST(_http_config() AS JSON))",
-
-		"CREATE OR REPLACE MACRO http_head(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR)) AS "
-		"_http_raw_request('HEAD', url, headers, NULL, NULL, "
-		"CAST(_http_config() AS JSON))",
-
-		"CREATE OR REPLACE MACRO http_options(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR)) AS "
-		"_http_raw_request('OPTIONS', url, headers, NULL, NULL, "
-		"CAST(_http_config() AS JSON))",
-
-		"CREATE OR REPLACE MACRO http_put(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR), body := NULL::VARCHAR, "
-		"content_type := NULL::VARCHAR) AS "
-		"_http_raw_request('PUT', url, headers, body, content_type, "
-		"CAST(_http_config() AS JSON))",
-
-		"CREATE OR REPLACE MACRO http_delete(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR)) AS "
-		"_http_raw_request('DELETE', url, headers, NULL, NULL, "
-		"CAST(_http_config() AS JSON))",
+	// SQL macros are defined in sql/*.sql files, embedded at build time
+	// by cmake/embed_sql.cmake into sql_resources.hpp.  Each file becomes
+	// a vector of SQL statements (split on semicolons, comments stripped).
+	// Registration order matters: http_config first (provides _http_config),
+	// then verbs (depend on _http_config), then helpers (depend on both).
+	const std::vector<std::vector<std::string> *> macro_groups = {
+		const_cast<std::vector<std::string> *>(&sql::http_config),
+		const_cast<std::vector<std::string> *>(&sql::http_verbs),
+		const_cast<std::vector<std::string> *>(&sql::http_config_helpers),
 	};
-	for (auto *sql : idempotent_scalar_macros) {
-		TryRegisterMacro(connection, sql);
+	for (auto *group : macro_groups) {
+		for (auto &stmt : *group) {
+			TryRegisterMacro(connection, stmt.c_str());
+		}
 	}
-
-	// Non-idempotent verbs: volatile, every call fires.
-	const char *volatile_scalar_macros[] = {
-		"CREATE OR REPLACE MACRO http_post(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR), body := NULL::VARCHAR, "
-		"content_type := NULL::VARCHAR) AS "
-		"_http_raw_request_volatile('POST', url, headers, body, content_type, "
-		"CAST(_http_config() AS JSON))",
-
-		"CREATE OR REPLACE MACRO http_patch(url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR), body := NULL::VARCHAR, "
-		"content_type := NULL::VARCHAR) AS "
-		"_http_raw_request_volatile('PATCH', url, headers, body, content_type, "
-		"CAST(_http_config() AS JSON))",
-	};
-	for (auto *sql : volatile_scalar_macros) {
-		TryRegisterMacro(connection, sql);
-	}
-
-	// Generic scalar: method is a runtime parameter, so must be volatile
-	// (we can't know at compile time whether it's idempotent).
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_request(method, url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR), body := NULL::VARCHAR, "
-		"content_type := NULL::VARCHAR) AS "
-		"_http_raw_request_volatile(method, url, headers, body, content_type, "
-		"CAST(_http_config() AS JSON))");
-
-	// JSON variants: wrap the STRUCT with to_json().
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_request_json(method, url, "
-		"headers := NULL::MAP(VARCHAR, VARCHAR), body := NULL::VARCHAR, "
-		"content_type := NULL::VARCHAR) AS "
-		"to_json(_http_raw_request_volatile(method, url, headers, body, content_type, "
-		"CAST(_http_config() AS JSON)))");
-
-	// --- Configuration helper macros ---
-	// These provide safe, merge-based updates to individual scopes within
-	// http_config.  They return the new MAP value for use with SET VARIABLE.
-
-	// http_config_set(scope, config_json) — merge a scope's JSON config
-	// into the existing http_config, preserving all other scopes.
-	// Cast config_json to VARCHAR so json_object() return values (JSON type)
-	// are compatible with the MAP(VARCHAR, VARCHAR) storage.
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_config_set(scope, config_json) AS "
-		"map_concat("
-		"  _http_config(),"
-		"  MAP([scope], [CAST(config_json AS VARCHAR)])"
-		")");
-
-	// http_config_remove(scope) — remove a scope from http_config.
-	// Returns the new MAP with the scope deleted.
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_config_remove(scope) AS "
-		"map_from_entries(["
-		"  entry FOR entry IN map_entries(_http_config()) "
-		"  IF entry.key != scope"
-		"])");
-
-	// http_config_get(scope) — read a single scope's JSON config.
-	// Returns the JSON string, or NULL if the scope is not configured.
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_config_get(scope) AS "
-		"_http_config()[scope]");
-
-	// http_config_set_bearer(scope, token, expires_at) — convenience for
-	// the common pattern of setting a bearer token with optional expiry.
-	// Uses json_object() for safe JSON construction (no string escaping issues).
-	TryRegisterMacro(connection,
-		"CREATE OR REPLACE MACRO http_config_set_bearer("
-		"scope, token, expires_at := 0) AS "
-		"http_config_set(scope, CASE "
-		"  WHEN expires_at > 0 THEN json_object("
-		"    'auth_type', 'bearer', "
-		"    'bearer_token', token, "
-		"    'bearer_token_expires_at', expires_at) "
-		"  ELSE json_object("
-		"    'auth_type', 'bearer', "
-		"    'bearer_token', token) "
-		"END)");
 }
 
 // ---------------------------------------------------------------------------
