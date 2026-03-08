@@ -78,6 +78,21 @@ jobs:
           assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}'
           assert all(r[0] == 200 for r in rows), f'Expected all 200s, got {[r[0] for r in rows]}'
 
+          # Parallel execution via Flask concurrency server
+          import json as pyjson
+          import urllib.request
+          urllib.request.urlopen('http://localhost:8444/reset')
+          con.execute(\"\"\"
+              SELECT r.response_status_code
+              FROM (
+                  SELECT http_get('http://localhost:8444/slow/' || id::VARCHAR || '?delay=0.2') AS r
+                  FROM range(5) AS t(id)
+              )
+          \"\"\").fetchall()
+          stats = pyjson.loads(urllib.request.urlopen('http://localhost:8444/stats').read())
+          assert stats['total_requests'] == 5, f'Expected 5 requests, got {stats[\"total_requests\"]}'
+          assert stats['peak_concurrent_connections'] > 1, f'Expected parallel execution, got peak={stats[\"peak_concurrent_connections\"]}'
+
           # Rate limit stats
           rows = con.execute('SELECT * FROM http_rate_limit_stats()').fetchall()
           assert len(rows) > 0, 'Expected rate limit stats rows'

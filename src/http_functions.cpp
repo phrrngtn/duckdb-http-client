@@ -195,11 +195,11 @@ BuildSession(const HttpBindData &bind_data, const HttpConfig &config) {
 
 	// Apply auth from config
 	if (config.auth_type == "negotiate" && cpr_headers.find("Authorization") == cpr_headers.end()) {
-		try {
-			auto neg_result = GenerateNegotiateToken(bind_data.url);
-			cpr_headers["Authorization"] = "Negotiate " + neg_result.token;
-		} catch (...) {
-		}
+		// Propagate Negotiate errors — a silent failure here would cause a
+		// confusing 401 downstream with no indication that token generation
+		// was even attempted.
+		auto neg_result = GenerateNegotiateToken(bind_data.url);
+		cpr_headers["Authorization"] = "Negotiate " + neg_result.token;
 	} else if (config.auth_type == "bearer" && !config.bearer_token.empty() &&
 	           cpr_headers.find("Authorization") == cpr_headers.end()) {
 		// Check expiry before using the token

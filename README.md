@@ -183,6 +183,9 @@ SET VARIABLE http_config = MAP {
 | `ca_bundle` | string | | Path to CA certificate bundle |
 | `auth_type` | string | | `"negotiate"` or `"bearer"` |
 | `bearer_token` | string | | Token for Bearer authentication |
+| `bearer_token_expires_at` | integer | 0 | Unix epoch seconds; request fails with a clear error if the token has expired. Set to 0 to disable expiry checking. |
+| `client_cert` | string | | Path to client certificate file (PEM) for mutual TLS |
+| `client_key` | string | | Path to client private key file (PEM) for mutual TLS |
 | `max_concurrent` | integer | 10 | Max parallel requests per scalar function chunk |
 | `global_rate_limit` | string | | Aggregate rate limit across all hosts (e.g. `"50/s"`) |
 | `global_burst` | number | 10.0 | Burst capacity for the global rate limiter |
@@ -215,6 +218,60 @@ FROM (SELECT http_get('https://api.example.com/v1/users') AS r);
 -- Also inherits timeout=30 from default
 SELECT r.response_status_code
 FROM (SELECT http_get('https://api.example.com/v2/users') AS r);
+```
+
+### Mutual TLS (mTLS)
+
+To authenticate with a client certificate:
+
+```sql
+SET VARIABLE http_config = MAP {
+    'https://secure-api.corp.com/': '{"client_cert": "/path/to/client.pem", "client_key": "/path/to/client-key.pem"}'
+};
+
+SELECT r.response_status_code
+FROM (SELECT http_get('https://secure-api.corp.com/endpoint') AS r);
+```
+
+Combine with `ca_bundle` if the server uses a private CA:
+
+```sql
+SET VARIABLE http_config = MAP {
+    'https://secure-api.corp.com/': '{"client_cert": "/path/to/client.pem", "client_key": "/path/to/client-key.pem", "ca_bundle": "/path/to/ca-chain.pem"}'
+};
+```
+
+### Bearer token with expiry
+
+When tokens have a known expiry time, set `bearer_token_expires_at` so the
+extension fails fast with a clear error rather than making a request that will
+be rejected:
+
+```sql
+SET VARIABLE http_config = MAP {
+    'https://api.vendor.com/': '{"auth_type": "bearer", "bearer_token": "eyJ...", "bearer_token_expires_at": 1741564800}'
+};
+```
+
+If the token has expired, the extension raises an error with ISO 8601
+timestamps:
+
+```
+Bearer token for api.vendor.com expired at 2025-03-10T00:00:00Z (1741564800)
+(current time: 2025-03-10T01:30:00Z (1741570200)).
+Refresh the token via your application and update http_config.
+```
+
+To update a single scope's token without clobbering other config, use
+`map_concat`:
+
+```sql
+SET VARIABLE http_config = map_concat(
+    IFNULL(TRY_CAST(getvariable('http_config') AS MAP(VARCHAR, VARCHAR)), MAP {}),
+    MAP {
+        'https://api.vendor.com/': '{"auth_type": "bearer", "bearer_token": "eyJnew...", "bearer_token_expires_at": 1741571400}'
+    }
+);
 ```
 
 ### Rate limiting
@@ -410,6 +467,48 @@ The fields:
 This is particularly useful for verifying that the correct SPN is being
 constructed, that the right security library is loaded, and that the hostname
 extraction is working as expected.
+
+## Troubleshooting
+
+### Negotiate auth returns an error
+
+- **"Negotiate authentication requires HTTPS"** — SPNEGO tokens are only
+  generated for HTTPS URLs. This prevents accidental credential leakage over
+  plaintext HTTP.
+
+- **GSS-API / SSPI errors** — Ensure you have a valid Kerberos ticket. On
+  macOS/Linux, run `klist` to check and `kinit` to obtain one. On Windows,
+  tickets are managed by the OS via domain login.
+
+- **Wrong SPN** — The extension constructs the SPN as `HTTP@hostname`. If
+  your service is registered under a different SPN, you'll get an authentication
+  failure. Use `negotiate_auth_header_json(url)` to inspect the SPN being used.
+
+### Bearer token expired
+
+The extension checks `bearer_token_expires_at` before each request. If your
+token has expired, you'll see an error with both ISO 8601 and Unix timestamps.
+Refresh the token in your hosting application and update the config using
+`map_concat` (see [Bearer token with expiry](#bearer-token-with-expiry)).
+
+### mTLS handshake failures
+
+- Verify that `client_cert` and `client_key` paths are absolute and readable
+  by the DuckDB process.
+- Ensure the certificate and key match (they must be from the same keypair).
+- If the server uses a private CA, set `ca_bundle` to the CA chain file.
+
+### Dead-column elimination
+
+`SELECT count(*) FROM (SELECT http_get(url) FROM urls)` fires zero requests
+because DuckDB's optimizer eliminates unused columns. Reference a field from
+the result to force evaluation:
+
+```sql
+SELECT count(*) FROM (
+    SELECT (http_get(url)).response_status_code AS status FROM urls
+);
+```
 
 ## Building
 

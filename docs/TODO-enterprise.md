@@ -87,6 +87,11 @@ supported. See README for usage.
 
 ## Expiring bearer tokens
 
+**Partially implemented.** The `bearer_token_expires_at` config field enables
+the extension to check token expiry before each request and fail fast with a
+clear error. The hosting application owns the refresh chain. See README for
+usage. What remains is extension-level automatic token refresh (below).
+
 Many corporate environments issue short-lived bearer tokens via a token
 endpoint that itself requires authentication (often Kerberos/Negotiate).
 The pattern is:

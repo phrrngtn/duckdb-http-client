@@ -133,11 +133,12 @@ elimination. There is no mechanism in DuckDB's C API to mark a function as
 "must always evaluate" regardless of whether its output is consumed. This is a
 documentation issue, not a code issue.
 
-### No CI
+### CI
 
-There is no GitHub Actions workflow. The sqllogictest suite depends on
-external services (httpbin.org) which makes CI unreliable without a local test
-server. The Flask concurrency server could be adapted for this purpose.
+~~There is no GitHub Actions workflow.~~ A GitHub Actions workflow now runs on
+Ubuntu and macOS, building the extension and running a Python test suite against
+a local Flask server. The sqllogictest suite still depends on httpbin.org for
+some tests and is not yet run in CI.
 
 ## What we would not change
 
@@ -145,9 +146,9 @@ server. The Flask concurrency server could be adapted for this purpose.
   clean separation of context vs compute. If `duckdb_function_get_variable`
   is ever added, the macros become optional sugar.
 
-- **JSON return type for the scalar function.** A STRUCT might give the
-  optimizer more to work with, but JSON is universally composable and
-  avoids locking the return schema into the function signature.
+- **STRUCT return type for the scalar function.** The primary functions
+  return a typed STRUCT with native MAP headers; `http_request_json` is
+  available as a JSON variant for callers that prefer a single string.
 
 - **Per-host rate limiting by default.** 20 req/s is conservative enough
   to prevent accidental damage, permissive enough not to interfere with
