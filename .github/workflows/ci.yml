@@ -52,3 +52,7 @@ jobs:
 
       - name: Run pytest (parallel execution verification)
         run: uv run pytest test/test_integration.py -v
+
+      - name: Stop test server
+        if: always()
+        run: pkill -f flask_concurrency_server || true

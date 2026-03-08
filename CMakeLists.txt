@@ -30,6 +30,10 @@ project(${EXTENSION_NAME} LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# All code (including static deps like cpr/libcurl) must be compiled with -fPIC
+# since the extension is a shared library.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 ###
 # Dependencies
 ###
