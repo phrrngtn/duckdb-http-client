@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -25,13 +28,7 @@ jobs:
       - name: Install test dependencies
         run: uv sync --python 3.12
 
-      - name: Build extension (Unix)
-        if: runner.os != 'Windows'
-        run: make GEN=ninja
-
-      - name: Build extension (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
+      - name: Build extension
         run: make GEN=ninja
 
       - name: Run sqllogictest (offline — no server needed)
@@ -41,23 +38,13 @@ jobs:
             --external-extension build/release/http_client.duckdb_extension \
             --file-path test/sql/http_client_local.test
 
-      - name: Start local test server (Unix)
-        if: runner.os != 'Windows'
+      - name: Start local test server
         run: |
           uv run python test/flask_concurrency_server.py &
           for i in $(seq 1 30); do
             curl -sf http://localhost:8444/health > /dev/null && break
             sleep 0.5
           done
-
-      - name: Start local test server (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Start-Process -NoNewWindow -FilePath uv -ArgumentList "run","python","test/flask_concurrency_server.py"
-          for ($i = 0; $i -lt 30; $i++) {
-            try { Invoke-WebRequest -Uri http://localhost:8444/health -UseBasicParsing -ErrorAction Stop | Out-Null; break } catch { Start-Sleep -Milliseconds 500 }
-          }
 
       - name: Run sqllogictest (server tests)
         run: |
@@ -69,14 +56,16 @@ jobs:
       - name: Run pytest (parallel execution verification)
         run: uv run pytest test/test_integration.py -v
 
-      - name: Stop test server (Unix)
-        if: always() && runner.os != 'Windows'
-        run: pkill -f flask_concurrency_server || true
-
-      - name: Stop test server (Windows)
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'flask_concurrency_server' } | Stop-Process -Force -ErrorAction SilentlyContinue
+      - name: Stop test server
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            taskkill //F //FI "WINDOWTITLE eq flask*" 2>/dev/null || true
+            # Also kill by image name matching python running our server
+            wmic process where "commandline like '%%flask_concurrency_server%%'" delete 2>/dev/null || true
+          else
+            pkill -f flask_concurrency_server || true
+          fi
 
       - name: Upload extension artifact
         uses: actions/upload-artifact@v4
