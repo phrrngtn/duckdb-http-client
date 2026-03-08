@@ -213,7 +213,11 @@ BuildSession(const HttpBindData &bind_data, const HttpConfig &config) {
 				auto format_time = [](int64_t epoch) -> std::string {
 					time_t t = static_cast<time_t>(epoch);
 					struct tm tm_buf;
+#ifdef _WIN32
+					gmtime_s(&tm_buf, &t);
+#else
 					gmtime_r(&t, &tm_buf);
+#endif
 					char buf[32];
 					strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
 					return std::string(buf) + " (" + std::to_string(epoch) + ")";
