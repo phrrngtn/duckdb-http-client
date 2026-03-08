@@ -1,0 +1,17 @@
+# name: test/sql/http_client.test
+# description: Test http_client extension
+# group: [http_client]
+
+require http_client
+
+# negotiate_auth_header requires HTTPS
+statement error
+SELECT negotiate_auth_header('http://example.com');
+----
+Negotiate authentication requires HTTPS
+
+# negotiate_auth_header requires a valid URL
+statement error
+SELECT negotiate_auth_header('not-a-url');
+----
+Invalid URL
