@@ -3,6 +3,8 @@ cmake_build/
 configure/
 .env
 venv/
+.venv/
+.pytest_cache/
 __pycache__/
 *.pyc
 .idea/

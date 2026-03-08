@@ -1,0 +1,11 @@
+[project]
+name = "duckdb-http-client-tests"
+version = "0.0.0"
+description = "Test dependencies for duckdb-http-client extension"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0",
+    "flask>=3.0",
+    "pytest>=8.0",
+    "duckdb-sqllogictest @ git+https://github.com/duckdb/duckdb-sqllogictest-python@2ac8dbc012ddbd96a57dca37784fd8ee3c0eb021",
+]
