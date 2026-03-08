@@ -90,6 +90,8 @@ else()
 	add_library(${EXTENSION_NAME} SHARED ${EXTENSION_SOURCES})
 	if(WIN32 AND MINGW)
 		set_target_properties(${EXTENSION_NAME} PROPERTIES PREFIX "")
+		# Statically link MinGW runtime so the DLL is self-contained
+		target_link_options(${EXTENSION_NAME} PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lpthread -Wl,-Bdynamic)
 	endif()
 endif()
 
