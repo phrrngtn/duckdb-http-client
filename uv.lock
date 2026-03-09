@@ -75,7 +75,7 @@ wheels = [
 ]
 
 [[package]]
-name = "duckdb-http-client-tests"
+name = "duckdb-http-enterprise-tests"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
@@ -87,7 +87,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.0" },
+    { name = "duckdb", specifier = ">=1.4.3" },
     { name = "duckdb-sqllogictest", git = "https://github.com/duckdb/duckdb-sqllogictest-python?rev=2ac8dbc012ddbd96a57dca37784fd8ee3c0eb021" },
     { name = "flask", specifier = ">=3.0" },
     { name = "pytest", specifier = ">=8.0" },
