@@ -482,6 +482,7 @@ static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chun
 		req.bind_data.config_entries = ParseJsonObject(config_json.c_str(), config_json.size());
 
 		req.config = ResolveConfig(url, req.bind_data.config_entries);
+		ResolveVaultSecrets(req.config, req.bind_data.params);
 		req.host = ExtractHost(url);
 
 		try {

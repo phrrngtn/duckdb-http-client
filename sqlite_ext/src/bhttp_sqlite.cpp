@@ -294,6 +294,7 @@ static void bhttp_request_func(sqlite3_context *ctx, int argc, sqlite3_value **a
 	}
 
 	HttpConfig config = ResolveConfig(url, config_entries);
+	ResolveVaultSecrets(config, params);
 
 	try {
 		auto result = ExecuteRequest(method, url, headers, params, body, content_type, config);
@@ -337,6 +338,7 @@ static void bhttp_get_func(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 	}
 
 	HttpConfig config = ResolveConfig(url_str, config_entries);
+	ResolveVaultSecrets(config, params);
 
 	try {
 		auto result = ExecuteRequest("GET", url_str, headers, params, "", "", config);
@@ -385,6 +387,7 @@ static void bhttp_post_func(sqlite3_context *ctx, int argc, sqlite3_value **argv
 	}
 
 	HttpConfig config = ResolveConfig(url_str, config_entries);
+	ResolveVaultSecrets(config, params);
 
 	try {
 		auto result = ExecuteRequest("POST", url_str, headers, params, body, "", config);

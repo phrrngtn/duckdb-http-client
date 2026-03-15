@@ -160,12 +160,35 @@ All scalar functions return a STRUCT with the same fields:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `url` | VARCHAR | (required) | Request URL |
-| `headers` | MAP(VARCHAR, VARCHAR) | NULL | Request headers as a MAP literal |
+| `headers` | MAP(VARCHAR, VARCHAR) | NULL | Request headers — MAP literals are cast to JSON internally. Also accepts JSON strings for dynamic composition via `json_object()`. |
+| `params` | VARCHAR (JSON) | NULL | Query parameters as a JSON object (`{"key": "value"}` → `?key=value`). Compose with `json_object()`, `json_merge_patch()`, or vault-derived values. |
 | `body` | VARCHAR | NULL | Request body (POST, PUT, PATCH only) |
 | `content_type` | VARCHAR | NULL | Content-Type (defaults to `application/json` if body is set) |
 
 The generic `http_request` also takes `method` (VARCHAR) as the first
 parameter.
+
+```sql
+-- Query params as a JSON object (no string concatenation)
+SELECT r.response_body
+FROM (SELECT http_get('https://api.example.com/search',
+    params := '{"q": "duckdb", "limit": "10"}') AS r);
+
+-- Dynamic params via json_object()
+SELECT r.response_body
+FROM (SELECT http_get('https://api.example.com/search',
+    params := json_object('q', search_term, 'limit', '10')) AS r)
+FROM search_terms;
+
+-- Compose params from multiple sources with json_merge_patch
+SELECT r.response_body
+FROM (SELECT http_get(base_url,
+    params := json_merge_patch(
+        '{"format": "json", "units": "metric"}',  -- base params
+        json_object('lat', lat, 'lng', lng)         -- per-row params
+    )) AS r)
+FROM locations;
+```
 
 ### Recommended pattern: subquery or CTE
 
@@ -293,6 +316,43 @@ SELECT http_config_get('https://api.vendor.com/');
 -- Remove a scope entirely
 SET VARIABLE http_config = http_config_remove('https://api.vendor.com/');
 ```
+
+### Vault / OpenBao integration
+
+API keys can be fetched automatically from [HashiCorp Vault](https://www.vaultproject.io/)
+or [OpenBao](https://openbao.org) (open-source fork, same API). When a scope
+has a `vault_path`, blobhttp fetches the secret before making the request and
+injects it per `auth_type` — no vault CTEs or manual key handling in the query.
+
+```sql
+SET VARIABLE http_config = MAP {
+    'default': '{"vault_addr": "http://127.0.0.1:8200", "vault_token": "dev-token"}',
+    'https://api.geocod.io/': '{"vault_path": "secret/blobapi/geocodio", "auth_type": "bearer"}',
+    'https://weather.visualcrossing.com/': '{"vault_path": "secret/blobapi/visualcrossing", "auth_type": "query_param", "vault_param_name": "key"}'
+};
+
+-- No API keys anywhere in the query — vault handles it
+SELECT json_extract_string(r.response_body, '$.results[0].formatted_address')
+FROM (SELECT http_get('https://api.geocod.io/v1.11/geocode',
+    params := '{"q": "02458"}') AS r);
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `vault_path` | string | | KV secret path (e.g. `secret/blobapi/geocodio`) |
+| `vault_addr` | string | `http://127.0.0.1:8200` | Vault/OpenBao address |
+| `vault_token` | string | | Vault auth token |
+| `vault_field` | string | `api_key` | Field to extract from the secret |
+| `vault_param_name` | string | | For `auth_type=query_param`: the query param name |
+| `vault_kv_version` | integer | 2 | KV secrets engine version (1 or 2) |
+
+The `vault_addr` and `vault_token` are typically set in the `default` scope
+and inherited by all service-specific scopes. The `vault_path` is per-scope.
+
+Secrets are cached in-process for 5 minutes to avoid repeated vault calls.
+The vault fetch itself is a bare HTTP GET with the token header — it does not
+go through blobhttp's config resolution, rate limiting, or proxy settings.
+Works with both Vault and OpenBao (identical HTTP API).
 
 ### Mutual TLS (mTLS)
 

@@ -1,8 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <unordered_map>
+
+#include <cpr/cpr.h>
 
 namespace blobhttp {
 
@@ -43,6 +48,16 @@ struct HttpConfig {
 	int max_concurrent = 10;       // max parallel requests in a scalar function chunk
 	std::string global_rate_limit_spec; // empty = no global limit; only meaningful from "default" scope
 	double global_burst = 10.0;
+
+	// Vault/OpenBao integration — fetch secrets automatically.
+	// If vault_path is set, blobhttp fetches the secret before making
+	// the actual request and injects it per auth_type.
+	std::string vault_path;            // e.g. "secret/blobapi/geocodio"
+	std::string vault_addr = "http://127.0.0.1:8200"; // vault/bao address
+	std::string vault_token;           // vault auth token
+	std::string vault_field = "api_key"; // field to extract from the secret
+	std::string vault_param_name;      // for auth_type=query_param: query param name for the key
+	int vault_kv_version = 2;          // KV secrets engine version (1 or 2)
 
 	//! Apply values from a JSON config object, overwriting only fields that are present.
 	void MergeFrom(const nlohmann::json &j) {
@@ -88,6 +103,24 @@ struct HttpConfig {
 		}
 		if (j.contains("global_burst") && j["global_burst"].is_number()) {
 			global_burst = j["global_burst"].get<double>();
+		}
+		if (j.contains("vault_path") && j["vault_path"].is_string()) {
+			vault_path = j["vault_path"].get<std::string>();
+		}
+		if (j.contains("vault_addr") && j["vault_addr"].is_string()) {
+			vault_addr = j["vault_addr"].get<std::string>();
+		}
+		if (j.contains("vault_token") && j["vault_token"].is_string()) {
+			vault_token = j["vault_token"].get<std::string>();
+		}
+		if (j.contains("vault_field") && j["vault_field"].is_string()) {
+			vault_field = j["vault_field"].get<std::string>();
+		}
+		if (j.contains("vault_param_name") && j["vault_param_name"].is_string()) {
+			vault_param_name = j["vault_param_name"].get<std::string>();
+		}
+		if (j.contains("vault_kv_version") && j["vault_kv_version"].is_number()) {
+			vault_kv_version = j["vault_kv_version"].get<int>();
 		}
 	}
 };
@@ -161,6 +194,125 @@ inline HttpConfig ResolveConfig(const std::string &url,
 	}
 
 	return config;
+}
+
+// ---------------------------------------------------------------------------
+// Vault/OpenBao secret fetching with process-global cache.
+//
+// Uses cpr directly — does NOT go through blobhttp config resolution,
+// so there's no recursion risk and no proxy/rate-limit/auth overhead.
+// Vault is assumed to be a local or trusted-network service.
+// ---------------------------------------------------------------------------
+
+//! Cache entry for a fetched vault secret.
+struct VaultCacheEntry {
+	std::string value;                                  // the extracted field value
+	std::chrono::steady_clock::time_point fetched_at;   // for TTL
+};
+
+//! Process-global vault secret cache. Thread-safe.
+inline std::string FetchVaultSecret(const std::string &vault_addr,
+                                     const std::string &vault_token,
+                                     const std::string &vault_path,
+                                     const std::string &vault_field,
+                                     int kv_version) {
+	// Cache key: addr + path + field
+	std::string cache_key = vault_addr + "|" + vault_path + "|" + vault_field;
+
+	static std::mutex cache_mutex;
+	static std::unordered_map<std::string, VaultCacheEntry> cache;
+	static constexpr auto CACHE_TTL = std::chrono::minutes(5);
+
+	// Check cache
+	{
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		auto it = cache.find(cache_key);
+		if (it != cache.end()) {
+			auto age = std::chrono::steady_clock::now() - it->second.fetched_at;
+			if (age < CACHE_TTL) {
+				return it->second.value;
+			}
+		}
+	}
+
+	// Fetch from vault — bare cpr, no blobhttp config
+	// KV v2: GET /v1/secret/data/{path} → $.data.data.{field}
+	// KV v1: GET /v1/{path}             → $.data.{field}
+	std::string url;
+	std::string json_path;
+	if (kv_version == 2) {
+		// vault_path might be "secret/blobapi/geocodio"
+		// KV v2 API: /v1/secret/data/blobapi/geocodio
+		auto slash = vault_path.find('/');
+		if (slash != std::string::npos) {
+			std::string mount = vault_path.substr(0, slash);
+			std::string subpath = vault_path.substr(slash + 1);
+			url = vault_addr + "/v1/" + mount + "/data/" + subpath;
+		} else {
+			url = vault_addr + "/v1/" + vault_path;
+		}
+		json_path = "data";  // nested under $.data.data for KV v2
+	} else {
+		url = vault_addr + "/v1/" + vault_path;
+		json_path = "";  // directly under $.data for KV v1
+	}
+
+	cpr::Response response = cpr::Get(
+		cpr::Url{url},
+		cpr::Header{{"X-Vault-Token", vault_token}},
+		cpr::Timeout{5000}
+	);
+
+	if (response.status_code != 200) {
+		throw std::runtime_error(
+			"Vault fetch failed for " + vault_path +
+			" (status " + std::to_string(response.status_code) + "): " +
+			response.text.substr(0, 200));
+	}
+
+	// Parse response and extract the field
+	std::string value;
+	try {
+		auto j = nlohmann::json::parse(response.text);
+		if (kv_version == 2) {
+			value = j["data"]["data"][vault_field].get<std::string>();
+		} else {
+			value = j["data"][vault_field].get<std::string>();
+		}
+	} catch (const std::exception &e) {
+		throw std::runtime_error(
+			"Vault secret parse error for " + vault_path + "." + vault_field +
+			": " + e.what());
+	}
+
+	// Cache it
+	{
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		cache[cache_key] = {value, std::chrono::steady_clock::now()};
+	}
+
+	return value;
+}
+
+//! After ResolveConfig, call this to fetch vault secrets and inject auth.
+//! Modifies config in place — sets bearer_token or populates params.
+inline void ResolveVaultSecrets(HttpConfig &config,
+                                 std::vector<std::pair<std::string, std::string>> &params) {
+	if (config.vault_path.empty() || config.vault_token.empty()) {
+		return;
+	}
+
+	std::string secret = FetchVaultSecret(
+		config.vault_addr, config.vault_token, config.vault_path,
+		config.vault_field, config.vault_kv_version);
+
+	if (config.auth_type == "bearer") {
+		config.bearer_token = secret;
+	} else if (config.auth_type == "query_param" && !config.vault_param_name.empty()) {
+		params.emplace_back(config.vault_param_name, secret);
+	}
+	// For other auth_types, the secret is fetched but the caller
+	// decides how to use it.
 }
 
 } // namespace blobhttp
