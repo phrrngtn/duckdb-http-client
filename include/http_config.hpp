@@ -4,7 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <string>
 
-namespace http_client {
+namespace blobhttp {
 
 //! Extract hostname from a URL, lowercased. Returns empty string on failure.
 inline std::string ExtractHostFromUrl(const std::string &url) {
@@ -92,9 +92,8 @@ struct HttpConfig {
 	}
 };
 
-//! Resolve the HttpConfig for a given URL by reading the http_config variable.
-//! The config_map_json is the result of querying getvariable('http_config') cast to JSON,
-//! represented as a map of scope -> json-config-string.
+//! Resolve the HttpConfig for a given URL from a config map.
+//! The config_entries is a map of scope -> json-config-string.
 //!
 //! Resolution order:
 //! 1. Hard-coded defaults (in HttpConfig struct)
@@ -164,4 +163,4 @@ inline HttpConfig ResolveConfig(const std::string &url,
 	return config;
 }
 
-} // namespace http_client
+} // namespace blobhttp

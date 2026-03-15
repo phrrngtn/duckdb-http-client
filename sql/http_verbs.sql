@@ -1,54 +1,72 @@
 -- Per-verb scalar macros route to the idempotent or volatile C function
 -- based on HTTP method semantics. All return STRUCT.
 --
--- Idempotent verbs: safe to deduplicate identical calls within a query.
--- GET, HEAD, OPTIONS are read-only; PUT and DELETE are idempotent by spec.
+-- The C function takes all VARCHAR (JSON strings) for headers, params,
+-- and config. The macros accept MAP literals for headers and convert
+-- via CAST(... AS JSON) so both forms work:
 --
--- Headers are MAP(VARCHAR, VARCHAR) — passed directly to the C function.
--- Config is read from the http_config variable and cast to JSON for the
--- C function, which uses nlohmann to parse per-scope config values.
+--   headers := MAP {'Authorization': 'Bearer xyz'}     -- literal
+--   headers := json_object('Authorization', token)     -- dynamic
+--   headers := vault_response_json                     -- from CTE
+--
+-- Params is a JSON object whose keys/values become URL query parameters.
+-- Compose layers with json_merge_patch(catalog_params, app_params).
 
 CREATE OR REPLACE MACRO http_get(url,
-    headers := NULL::MAP(VARCHAR, VARCHAR)) AS
-    _http_raw_request('GET', url, headers, NULL, NULL,
+    headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR) AS
+    _http_raw_request('GET', url,
+        CAST(headers AS JSON), params, NULL, NULL,
         CAST(_http_config() AS JSON));
 
 CREATE OR REPLACE MACRO http_head(url,
-    headers := NULL::MAP(VARCHAR, VARCHAR)) AS
-    _http_raw_request('HEAD', url, headers, NULL, NULL,
+    headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR) AS
+    _http_raw_request('HEAD', url,
+        CAST(headers AS JSON), params, NULL, NULL,
         CAST(_http_config() AS JSON));
 
 CREATE OR REPLACE MACRO http_options(url,
-    headers := NULL::MAP(VARCHAR, VARCHAR)) AS
-    _http_raw_request('OPTIONS', url, headers, NULL, NULL,
+    headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR) AS
+    _http_raw_request('OPTIONS', url,
+        CAST(headers AS JSON), params, NULL, NULL,
         CAST(_http_config() AS JSON));
 
 CREATE OR REPLACE MACRO http_put(url,
     headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR,
     body := NULL::VARCHAR,
     content_type := NULL::VARCHAR) AS
-    _http_raw_request('PUT', url, headers, body, content_type,
+    _http_raw_request('PUT', url,
+        CAST(headers AS JSON), params, body, content_type,
         CAST(_http_config() AS JSON));
 
 CREATE OR REPLACE MACRO http_delete(url,
-    headers := NULL::MAP(VARCHAR, VARCHAR)) AS
-    _http_raw_request('DELETE', url, headers, NULL, NULL,
+    headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR) AS
+    _http_raw_request('DELETE', url,
+        CAST(headers AS JSON), params, NULL, NULL,
         CAST(_http_config() AS JSON));
 
 -- Non-idempotent verbs: volatile, every call fires.
 
 CREATE OR REPLACE MACRO http_post(url,
     headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR,
     body := NULL::VARCHAR,
     content_type := NULL::VARCHAR) AS
-    _http_raw_request_volatile('POST', url, headers, body, content_type,
+    _http_raw_request_volatile('POST', url,
+        CAST(headers AS JSON), params, body, content_type,
         CAST(_http_config() AS JSON));
 
 CREATE OR REPLACE MACRO http_patch(url,
     headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR,
     body := NULL::VARCHAR,
     content_type := NULL::VARCHAR) AS
-    _http_raw_request_volatile('PATCH', url, headers, body, content_type,
+    _http_raw_request_volatile('PATCH', url,
+        CAST(headers AS JSON), params, body, content_type,
         CAST(_http_config() AS JSON));
 
 -- Generic scalar: method is a runtime parameter, so must be volatile
@@ -56,16 +74,20 @@ CREATE OR REPLACE MACRO http_patch(url,
 
 CREATE OR REPLACE MACRO http_request(method, url,
     headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR,
     body := NULL::VARCHAR,
     content_type := NULL::VARCHAR) AS
-    _http_raw_request_volatile(method, url, headers, body, content_type,
+    _http_raw_request_volatile(method, url,
+        CAST(headers AS JSON), params, body, content_type,
         CAST(_http_config() AS JSON));
 
 -- JSON variant: wraps the STRUCT with to_json().
 
 CREATE OR REPLACE MACRO http_request_json(method, url,
     headers := NULL::MAP(VARCHAR, VARCHAR),
+    params := NULL::VARCHAR,
     body := NULL::VARCHAR,
     content_type := NULL::VARCHAR) AS
-    to_json(_http_raw_request_volatile(method, url, headers, body, content_type,
+    to_json(_http_raw_request_volatile(method, url,
+        CAST(headers AS JSON), params, body, content_type,
         CAST(_http_config() AS JSON)));

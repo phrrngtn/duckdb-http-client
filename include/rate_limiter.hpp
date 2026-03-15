@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace http_client {
+namespace blobhttp {
 
 //! GCRA (Generic Cell Rate Algorithm) rate limiter with diagnostic counters
 //! and adaptive 429 backoff.
@@ -207,4 +207,4 @@ private:
 	LRUPool<std::string, GCRARateLimiter> pool_;
 };
 
-} // namespace http_client
+} // namespace blobhttp

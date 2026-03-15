@@ -3,7 +3,7 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Main extension configuration
-EXTENSION_NAME=http_enterprise
+EXTENSION_NAME=bhttp
 
 # Set to 1 to enable Unstable API (binaries will only work on TARGET_DUCKDB_VERSION, forwards compatibility will be broken)
 USE_UNSTABLE_C_API=0

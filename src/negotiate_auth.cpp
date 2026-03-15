@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-namespace http_client {
+namespace blobhttp {
 
 // ---------------------------------------------------------------------------
 // Base64 encoder (standalone, no DuckDB dependency)
@@ -430,4 +430,4 @@ NegotiateResult GenerateNegotiateToken(const std::string &url) {
 
 #endif // _WIN32
 
-} // namespace http_client
+} // namespace blobhttp

@@ -32,7 +32,7 @@ jobs:
         run: |
           uv run python -m duckdb_sqllogictest \
             --test-dir test/sql \
-            --external-extension build/release/http_enterprise.duckdb_extension \
+            --external-extension build/release/bhttp.duckdb_extension \
             --file-path test/sql/http_client_local.test
 
       - name: Start local test server
@@ -47,7 +47,7 @@ jobs:
         run: |
           uv run python -m duckdb_sqllogictest \
             --test-dir test/sql \
-            --external-extension build/release/http_enterprise.duckdb_extension \
+            --external-extension build/release/bhttp.duckdb_extension \
             --file-path test/sql/http_client_server.test
 
       - name: Run pytest (parallel execution verification)
@@ -58,7 +58,6 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             taskkill //F //FI "WINDOWTITLE eq flask*" 2>/dev/null || true
-            # Also kill by image name matching python running our server
             wmic process where "commandline like '%%flask_concurrency_server%%'" delete 2>/dev/null || true
           else
             pkill -f flask_concurrency_server || true
@@ -67,5 +66,5 @@ jobs:
       - name: Upload extension artifact
         uses: actions/upload-artifact@v4
         with:
-          name: http_enterprise-${{ matrix.os }}
-          path: build/release/http_enterprise.duckdb_extension
+          name: bhttp-${{ matrix.os }}
+          path: build/release/bhttp.duckdb_extension

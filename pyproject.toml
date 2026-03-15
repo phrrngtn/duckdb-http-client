@@ -1,11 +1,34 @@
+[build-system]
+requires = ["scikit-build-core>=0.5", "nanobind>=1.5"]
+build-backend = "scikit_build_core.build"
+
 [project]
-name = "duckdb-http-enterprise-tests"
-version = "0.0.0"
-description = "Test dependencies for duckdb-http-client extension"
+name = "blobhttp"
+version = "0.1.0"
+description = "Enterprise HTTP client with rate limiting, SPNEGO auth, and connection pooling"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
+license = {text = "MIT"}
+authors = [{name = "Paul Harrington"}]
+dependencies = []
+keywords = ["http", "spnego", "kerberos", "rate-limiting", "duckdb", "sqlite"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.optional-dependencies]
+test = [
     "duckdb>=1.4.3",
     "flask>=3.0",
     "pytest>=8.0",
     "duckdb-sqllogictest @ git+https://github.com/duckdb/duckdb-sqllogictest-python@2ac8dbc012ddbd96a57dca37784fd8ee3c0eb021",
 ]
+
+[tool.scikit-build]
+cmake.args = ["-DBUILD_PYTHON_BINDINGS=ON", "-DBUILD_DUCKDB_EXTENSION=OFF"]
+wheel.packages = ["python/blobhttp"]

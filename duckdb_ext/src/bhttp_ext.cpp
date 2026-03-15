@@ -1,5 +1,5 @@
 #include "duckdb_extension.h"
-#include "http_client_extension.hpp"
+#include "bhttp_ext.hpp"
 #include "negotiate_auth.hpp"
 
 #include <cstring>
@@ -28,7 +28,7 @@ static void NegotiateAuthTokenFunc(duckdb_function_info info, duckdb_data_chunk 
 		std::string error_msg;
 
 		try {
-			auto result = http_client::GenerateNegotiateToken(url);
+			auto result = blobhttp::GenerateNegotiateToken(url);
 			std::string header = "Negotiate " + result.token;
 			duckdb_vector_assign_string_element_len(output, row, header.c_str(), header.length());
 		} catch (const std::exception &e) {
@@ -56,7 +56,7 @@ static void NegotiateAuthTokenJsonFunc(duckdb_function_info info, duckdb_data_ch
 		std::string url(url_str, url_len);
 
 		try {
-			auto result = http_client::GenerateNegotiateToken(url);
+			auto result = blobhttp::GenerateNegotiateToken(url);
 
 			nlohmann::json j;
 			j["token"] = result.token;
@@ -104,6 +104,6 @@ DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info 
                             struct duckdb_extension_access *access) {
 	RegisterScalarVarcharFunction(connection, "negotiate_auth_header", NegotiateAuthTokenFunc);
 	RegisterScalarVarcharFunction(connection, "negotiate_auth_header_json", NegotiateAuthTokenJsonFunc);
-	http_client::RegisterHttpFunctions(connection);
+	blobhttp::RegisterHttpFunctions(connection);
 	return true;
 }

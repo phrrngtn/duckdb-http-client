@@ -12,6 +12,28 @@ wheels = [
 ]
 
 [[package]]
+name = "blobhttp"
+version = "0.1.0"
+source = { editable = "." }
+
+[package.optional-dependencies]
+test = [
+    { name = "duckdb" },
+    { name = "duckdb-sqllogictest" },
+    { name = "flask" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "duckdb", marker = "extra == 'test'", specifier = ">=1.4.3" },
+    { name = "duckdb-sqllogictest", marker = "extra == 'test'", git = "https://github.com/duckdb/duckdb-sqllogictest-python?rev=2ac8dbc012ddbd96a57dca37784fd8ee3c0eb021" },
+    { name = "flask", marker = "extra == 'test'", specifier = ">=3.0" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
+]
+provides-extras = ["test"]
+
+[[package]]
 name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -72,25 +94,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/26/0a/6ae31b2914b4dc34243279b2301554bcbc5f1a09ccc82600486c49ab71d1/duckdb-1.4.4-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d0440f59e0cd9936a9ebfcf7a13312eda480c79214ffed3878d75947fc3b7d6d", size = 20435641, upload-time = "2026-01-26T11:50:12.188Z" },
     { url = "https://files.pythonhosted.org/packages/d2/b1/fd5c37c53d45efe979f67e9bd49aaceef640147bb18f0699a19edd1874d6/duckdb-1.4.4-cp314-cp314-win_amd64.whl", hash = "sha256:59c8d76016dde854beab844935b1ec31de358d4053e792988108e995b18c08e7", size = 12762360, upload-time = "2026-01-26T11:50:14.76Z" },
     { url = "https://files.pythonhosted.org/packages/dd/2d/13e6024e613679d8a489dd922f199ef4b1d08a456a58eadd96dc2f05171f/duckdb-1.4.4-cp314-cp314-win_arm64.whl", hash = "sha256:53cd6423136ab44383ec9955aefe7599b3fb3dd1fe006161e6396d8167e0e0d4", size = 13458633, upload-time = "2026-01-26T11:50:17.657Z" },
-]
-
-[[package]]
-name = "duckdb-http-enterprise-tests"
-version = "0.0.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "duckdb" },
-    { name = "duckdb-sqllogictest" },
-    { name = "flask" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "duckdb", specifier = ">=1.4.3" },
-    { name = "duckdb-sqllogictest", git = "https://github.com/duckdb/duckdb-sqllogictest-python?rev=2ac8dbc012ddbd96a57dca37784fd8ee3c0eb021" },
-    { name = "flask", specifier = ">=3.0" },
-    { name = "pytest", specifier = ">=8.0" },
 ]
 
 [[package]]

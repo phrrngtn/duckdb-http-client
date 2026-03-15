@@ -64,7 +64,7 @@ def main():
         "#include <string>",
         "#include <vector>",
         "",
-        "namespace http_client {",
+        "namespace blobhttp {",
         "namespace sql {",
         "",
     ]
@@ -83,7 +83,7 @@ def main():
         lines.append("")
 
     lines.append("} // namespace sql")
-    lines.append("} // namespace http_client")
+    lines.append("} // namespace blobhttp")
     lines.append("")
 
     output_file.write_text("\n".join(lines))

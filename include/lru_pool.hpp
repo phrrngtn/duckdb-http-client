@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace http_client {
+namespace blobhttp {
 
 //! A thread-safe LRU pool mapping keys to values.
 //! When the pool exceeds max_size, the least-recently-used entry is evicted.
@@ -88,4 +88,4 @@ private:
 	std::unordered_map<K, typename std::list<std::pair<K, V>>::iterator> index_;
 };
 
-} // namespace http_client
+} // namespace blobhttp

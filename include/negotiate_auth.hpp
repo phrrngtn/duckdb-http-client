@@ -2,7 +2,7 @@
 
 #include <string>
 
-namespace http_client {
+namespace blobhttp {
 
 //! Result of a Negotiate token generation attempt.
 struct NegotiateResult {
@@ -29,4 +29,4 @@ std::string GetSecurityLibraryName();
 //! Returns the provider name ("SSPI", "GSS-API", or "unavailable").
 std::string GetProviderName();
 
-} // namespace http_client
+} // namespace blobhttp

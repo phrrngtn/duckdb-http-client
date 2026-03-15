@@ -1,5 +1,5 @@
 #include "duckdb_extension.h"
-#include "http_client_extension.hpp"
+#include "bhttp_ext.hpp"
 #include "http_config.hpp"
 #include "lru_pool.hpp"
 #include "negotiate_auth.hpp"
@@ -19,7 +19,7 @@
 
 DUCKDB_EXTENSION_EXTERN
 
-namespace http_client {
+namespace blobhttp {
 
 // ---------------------------------------------------------------------------
 // Global state: session pool and rate limiter registry
@@ -426,14 +426,16 @@ static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chun
 
 	duckdb_vector method_vec = duckdb_data_chunk_get_vector(input, 0);
 	duckdb_vector url_vec = duckdb_data_chunk_get_vector(input, 1);
-	duckdb_vector headers_vec = duckdb_data_chunk_get_vector(input, 2);  // MAP(VARCHAR, VARCHAR)
-	duckdb_vector body_vec = duckdb_data_chunk_get_vector(input, 3);
-	duckdb_vector ct_vec = duckdb_data_chunk_get_vector(input, 4);
-	duckdb_vector config_vec = duckdb_data_chunk_get_vector(input, 5);  // config JSON string
+	duckdb_vector headers_vec = duckdb_data_chunk_get_vector(input, 2);  // headers JSON string
+	duckdb_vector params_vec = duckdb_data_chunk_get_vector(input, 3);   // params JSON string
+	duckdb_vector body_vec = duckdb_data_chunk_get_vector(input, 4);
+	duckdb_vector ct_vec = duckdb_data_chunk_get_vector(input, 5);
+	duckdb_vector config_vec = duckdb_data_chunk_get_vector(input, 6);   // config JSON string
 
 	auto *method_validity = duckdb_vector_get_validity(method_vec);
 	auto *url_validity = duckdb_vector_get_validity(url_vec);
 	auto *headers_validity = duckdb_vector_get_validity(headers_vec);
+	auto *params_validity = duckdb_vector_get_validity(params_vec);
 	auto *body_validity = duckdb_vector_get_validity(body_vec);
 	auto *ct_validity = duckdb_vector_get_validity(ct_vec);
 	auto *config_validity = duckdb_vector_get_validity(config_vec);
@@ -464,6 +466,7 @@ static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chun
 			c = toupper(c);
 		}
 
+		auto params_json = ReadVarchar(params_vec, params_validity, row);
 		auto body = ReadVarchar(body_vec, body_validity, row);
 		auto content_type = ReadVarchar(ct_vec, ct_validity, row);
 		auto config_json = ReadVarchar(config_vec, config_validity, row);
@@ -471,7 +474,9 @@ static void HttpRawRequestScalarFunc(duckdb_function_info info, duckdb_data_chun
 		auto &req = rows[row];
 		req.bind_data.method = method;
 		req.bind_data.url = url;
-		req.bind_data.headers = ReadMapVector(headers_vec, headers_validity, row);
+		auto headers_json = ReadVarchar(headers_vec, headers_validity, row);
+		req.bind_data.headers = ParseJsonObject(headers_json.c_str(), headers_json.size());
+		req.bind_data.params = ParseJsonObject(params_json.c_str(), params_json.size());
 		req.bind_data.body = body;
 		req.bind_data.content_type = content_type;
 		req.bind_data.config_entries = ParseJsonObject(config_json.c_str(), config_json.size());
@@ -606,13 +611,16 @@ static void RegisterHttpScalarVariant(duckdb_connection connection, const char *
 	duckdb_logical_type varchar_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
 	duckdb_logical_type map_type = duckdb_create_map_type(varchar_type, varchar_type);
 
-	// (method, url, headers_map, body, content_type, config_json)
-	duckdb_scalar_function_add_parameter(function, varchar_type); // method
-	duckdb_scalar_function_add_parameter(function, varchar_type); // url
-	duckdb_scalar_function_add_parameter(function, map_type);     // headers MAP(VARCHAR, VARCHAR)
-	duckdb_scalar_function_add_parameter(function, varchar_type); // body
-	duckdb_scalar_function_add_parameter(function, varchar_type); // content_type
-	duckdb_scalar_function_add_parameter(function, varchar_type); // config (JSON string)
+	// All VARCHAR (JSON strings) — uniform, composable, works across SQLite/DuckDB.
+	// The SQL macros use CAST(headers AS JSON) to accept MAP literals transparently.
+	// (method, url, headers_json, params_json, body, content_type, config_json)
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 0: method
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 1: url
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 2: headers (JSON object)
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 3: params (JSON object → query string)
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 4: body
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 5: content_type
+	duckdb_scalar_function_add_parameter(function, varchar_type); // 6: config (JSON string)
 
 	duckdb_logical_type struct_type = CreateHttpResultStructType();
 	duckdb_scalar_function_set_return_type(function, struct_type);
@@ -810,7 +818,7 @@ static void TryRegisterMacro(duckdb_connection connection, const char *sql) {
 
 void RegisterHttpMacros(duckdb_connection connection) {
 	// SQL macros are defined in sql/*.sql files, embedded at build time
-	// by cmake/embed_sql.cmake into sql_resources.hpp.  Each file becomes
+	// by cmake/embed_sql.py into sql_resources.hpp.  Each file becomes
 	// a vector of SQL statements (split on semicolons, comments stripped).
 	// Registration order matters: http_config first (provides _http_config),
 	// then verbs (depend on _http_config), then helpers (depend on both).
@@ -841,4 +849,4 @@ void RegisterHttpFunctions(duckdb_connection connection) {
 	RegisterHttpMacros(connection);
 }
 
-} // namespace http_client
+} // namespace blobhttp
