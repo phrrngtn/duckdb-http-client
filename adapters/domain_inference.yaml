@@ -1,0 +1,127 @@
+# domain_inference adapter: infer column domains, functional dependencies,
+# and pivoted (wide-format) structure from column names and sample data.
+#
+# Input params:
+#   header: array of column names
+#   body:   array of arrays (sample rows, values in column order)
+#           May be empty — inference works from column names alone.
+#
+# Output schema has three sections:
+#   columns:                 semantic domain per column
+#   functional_dependencies: inferred FDs from world knowledge
+#   pivoted_columns:         groups of columns that should be UNPIVOTed,
+#                            with extracted component names and values
+
+- name: domain_inference
+
+  prompt_template: |
+    Given a table with these columns and sample data, infer the semantic
+    domain of each column, any likely functional dependencies, and whether
+    any groups of columns represent a pivoted (wide-format) structure that
+    should be unpivoted.
+
+    Columns: {{ header }}
+
+    {% if length(body) > 0 %}Sample data (JSON array of arrays, in column order above):
+    {{ body }}{% else %}No sample data available — infer from column names only.{% endif %}
+
+    TASK 1 — COLUMN DOMAINS:
+    For each column, classify its semantic domain. Use specific domain names
+    like: country_code, country_name, currency_code, currency_name, city,
+    postal_code, person_name, email, phone, date, timestamp, identifier,
+    quantity, amount, price, percentage, latitude, longitude, url, status,
+    boolean_flag, free_text, fiscal_year, tax_district, address, zip_code,
+    geospatial_point, unknown.
+
+    TASK 2 — FUNCTIONAL DEPENDENCIES:
+    Identify pairs where one column likely determines another based on
+    real-world knowledge. Only include dependencies you are confident about.
+
+    TASK 3 — PIVOT DETECTION:
+    Look for groups of columns that follow a naming pattern suggesting they
+    are a pivoted (wide-format) representation of what should be rows.
+    Common patterns:
+    - sales_2020, sales_2021, sales_2022 → measure="sales", component="year"
+    - q1_revenue, q2_revenue, q3_revenue → measure="revenue", component="quarter"
+    - _2007_ut, _2008_ut, _2007_us → components are "year" and "state"
+    - male_count, female_count → measure="count", component="gender"
+
+    For each detected pivot group, list the columns involved, the extracted
+    component names and their values per column (in the same order as the
+    columns list), and what the measure represents. This metadata should be
+    sufficient to write an UNPIVOT query.
+
+  output_schema:
+    type: object
+    required: [columns, functional_dependencies, pivoted_columns]
+    properties:
+      columns:
+        type: array
+        items:
+          type: object
+          required: [column_name, domain, confidence, reasoning]
+          properties:
+            column_name:
+              type: string
+            domain:
+              type: string
+            confidence:
+              type: number
+              minimum: 0
+              maximum: 1
+            reasoning:
+              type: string
+          additionalProperties: false
+      functional_dependencies:
+        type: array
+        items:
+          type: object
+          required: [determinant, dependent, confidence, reasoning]
+          properties:
+            determinant:
+              type: string
+            dependent:
+              type: string
+            confidence:
+              type: number
+              minimum: 0
+              maximum: 1
+            reasoning:
+              type: string
+          additionalProperties: false
+      pivoted_columns:
+        type: array
+        items:
+          type: object
+          required: [columns, components, measure_name, confidence, reasoning]
+          properties:
+            columns:
+              type: array
+              items:
+                type: string
+            components:
+              type: array
+              items:
+                type: object
+                required: [name, values]
+                properties:
+                  name:
+                    type: string
+                  values:
+                    type: array
+                    items:
+                      type: string
+                additionalProperties: false
+            measure_name:
+              type: string
+            confidence:
+              type: number
+              minimum: 0
+              maximum: 1
+            reasoning:
+              type: string
+          additionalProperties: false
+    additionalProperties: false
+
+  response_jmespath: ""
+  max_tokens: 8192

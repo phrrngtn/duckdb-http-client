@@ -1,0 +1,39 @@
+# physical_properties adapter: look up physical properties of substances.
+#
+# Input params:
+#   substances: array of substance names
+#   metrics:    array of metric names (cross-product implied)
+#
+# Output: list-of-dicts with {substance, metric, unit_of_measure, value}
+# extracted via response_jmespath from the wrapper object.
+
+- name: physical_properties
+
+  prompt_template: |
+    For each of these substances: {{ join(substances, ", ") }}.
+    Return the following measurements in SI units: {{ join(metrics, ", ") }}.
+    Return one row per substance-metric combination.
+
+  output_schema:
+    type: object
+    required: [measurements]
+    properties:
+      measurements:
+        type: array
+        items:
+          type: object
+          required: [substance, metric, unit_of_measure, value]
+          properties:
+            substance:
+              type: string
+            metric:
+              type: string
+            unit_of_measure:
+              type: string
+            value:
+              type: number
+          additionalProperties: false
+    additionalProperties: false
+
+  response_jmespath: "measurements"
+  max_tokens: 4096
